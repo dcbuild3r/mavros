@@ -490,6 +490,8 @@ impl CSE {
                 Constant::I(bits, value) => interner.iconst(*bits, *value),
                 Constant::Field(value) => interner.fconst(*value),
                 Constant::FnPtr(_) => continue,
+                // Array constants are already deduped by the constant store; skip them here.
+                Constant::Array { .. } => continue,
             };
             exprs.insert(*vid, id);
         }

@@ -383,6 +383,8 @@ fn compute_constant_bounds(ssa: &HLSSA) -> HashMap<ValueId, IntInterval> {
                 }
                 Constant::Field(f) => IntInterval::singleton(field_to_bigint(f)),
                 Constant::FnPtr(_) => IntInterval::top(),
+                // An array is not a scalar integer value.
+                Constant::Array { .. } => IntInterval::top(),
             };
             (*vid, r)
         })

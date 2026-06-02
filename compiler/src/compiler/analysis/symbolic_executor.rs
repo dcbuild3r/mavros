@@ -736,6 +736,11 @@ where
             Constant::FnPtr(_) => {
                 todo!("FnPtrConst in symbolic executor");
             }
+            Constant::Array { .. } => {
+                // Array constants are only produced once the frontend routes constant array
+                // literals to them; the symbolic executor will need real aggregate support then.
+                todo!("array constants in symbolic executor");
+            }
         };
         consts.insert(vid, v);
     }

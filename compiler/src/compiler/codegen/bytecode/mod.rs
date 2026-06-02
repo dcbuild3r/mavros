@@ -113,6 +113,12 @@ fn materialize_constants(
             hlssa::Constant::FnPtr(_) => {
                 panic!("FnPtr constants not supported in codegen");
             }
+            hlssa::Constant::Array { .. } => {
+                // The bytecode backend does not yet materialize array constants; this is deferred
+                // alongside routing the frontend to produce them. The HLSSA->LLSSA path handles
+                // them today (see materialize_array_constant).
+                todo!("array constants in bytecode backend — deferred with frontend");
+            }
         }
     }
 }

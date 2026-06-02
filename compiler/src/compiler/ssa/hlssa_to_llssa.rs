@@ -516,12 +516,16 @@ fn lower_inner(
 /// All HLSSA constants are interned into LLSSA's module-level constants table. Scalar `U`/`I`
 /// constants become `LLConstant::Int`; field constants become an aggregate `LLConstant::Struct`
 /// holding the four-limb `field_elem()` layout with one `Int` value per limb.
+/// Lower the scalar constants referenced by `function` into `val_map`, returning the (sorted)
+/// ValueIds of any referenced *array* constants. Array constants cannot be interned as LLSSA
+/// constants — they are materialized as heap-allocated RC'd arrays in the entry block by
+/// [`materialize_array_constant`], so they are skipped here and returned to the caller.
 fn lower_constants_llssa(
     function: &HLFunction,
     constants: &HLSSAConstantsSnapshot,
     llssa: &mut LLSSA,
     val_map: &mut HashMap<ValueId, ValueId>,
-) {
+) -> Vec<ValueId> {
     let mut referenced = HashSet::new();
     for (_, block) in function.get_blocks() {
         for instr in block.get_instructions() {
@@ -550,12 +554,13 @@ fn lower_constants_llssa(
     }
 
     if referenced.is_empty() {
-        return;
+        return Vec::new();
     }
 
     let mut referenced: Vec<ValueId> = referenced.into_iter().collect();
     referenced.sort_by_key(|v| v.0);
 
+    let mut array_consts = Vec::new();
     for vid in referenced {
         match constants.get(&vid).expect("vid is in constants").as_ref() {
             Constant::U(bits, val) => {
@@ -594,6 +599,78 @@ fn lower_constants_llssa(
             Constant::FnPtr(_) => {
                 panic!("FnPtr constants not supported in HLSSA->LLSSA lowering");
             }
+            Constant::Array { .. } => {
+                // Materialized as a heap-allocated RC'd array in the entry block; see
+                // `materialize_array_constant`. Collect for the caller. TEMPORARY.
+                array_consts.push(vid);
+            }
+        }
+    }
+
+    array_consts
+}
+
+/// Materialize a constant into LLSSA values, emitting instructions into `e`.
+///
+/// Scalars (`U`/`I`/`Field`) become interned LLSSA constants. An `Array` becomes a
+/// heap-allocated, reference-counted array — byte-for-byte the structure `lower_mk_array`
+/// produces for a `MkSeq`, with `RC = 1` so that the bump/drop ops `RCInsertion` already
+/// inserted around the constant's value balance correctly. Nested arrays recurse, emitting the
+/// inner array (and so its pointer) before the outer store that consumes it.
+fn materialize_array_constant(e: &mut LLBlockEmitter<'_>, c: &Constant) -> ValueId {
+    match c {
+        Constant::U(bits, val) => e.emit_int_const_u128(*bits as u32, *val),
+        Constant::I(bits, val) => {
+            assert!(
+                *bits <= MAX_SUPPORTED_SIGNED_BITS,
+                "signed integers wider than i{MAX_SUPPORTED_SIGNED_BITS} are unsupported"
+            );
+            e.emit_int_const_u128(*bits as u32, *val)
+        }
+        Constant::Field(fr) => {
+            let values =
+                fr.0.0 // Montgomery form
+                    .iter()
+                    .map(|&l| LLConstant::Int {
+                        bits: 64,
+                        value: l as u128,
+                    })
+                    .collect();
+            e.emit_struct_const(LLStruct::field_elem(), values)
+        }
+        Constant::FnPtr(_) => panic!("FnPtr constants are not allowed as array-constant elements"),
+        Constant::Array { elem_type, elems } => {
+            // Materialize elements first so nested-array pointers dominate the outer stores.
+            let child_vals: Vec<ValueId> = elems
+                .iter()
+                .map(|elem| materialize_array_constant(e, elem))
+                .collect();
+
+            let count = elems.len();
+            let rc_struct = rc_array_struct(elem_type, count);
+            let es = elem_struct(elem_type);
+
+            // Allocate
+            let arr = e.heap_alloc(rc_struct.clone(), None);
+
+            // Init RC to 1 (mirrors lower_mk_array; RCInsertion balances the rest)
+            let rc_hdr = e.struct_field_ptr(arr, rc_struct.clone(), 0);
+            let rc_word = e.struct_field_ptr(rc_hdr, LLStruct::rc_header(), 0);
+            let one = e.emit_int_const(64, 1);
+            e.ll_store(rc_word, one);
+            let table_id = e.struct_field_ptr(arr, rc_struct.clone(), 1);
+            let unassigned = e.emit_int_const(64, u64::MAX);
+            e.ll_store(table_id, unassigned);
+
+            // Store elements
+            let data = e.struct_field_ptr(arr, rc_struct, 2);
+            for (i, ll_elem) in child_vals.into_iter().enumerate() {
+                let idx = e.emit_int_const(64, i as u64);
+                let elem_ptr = e.array_elem_ptr(data, es.clone(), idx);
+                e.ll_store(elem_ptr, ll_elem);
+            }
+
+            arr
         }
     }
 }
@@ -647,7 +724,7 @@ fn lower_function(
         }
     }
 
-    lower_constants_llssa(function, constants, llssa, &mut val_map);
+    let array_const_vids = lower_constants_llssa(function, constants, llssa, &mut val_map);
 
     // Lower instructions and terminators in domination order
     for block_id in cfg.get_domination_pre_order() {
@@ -656,6 +733,17 @@ fn lower_function(
 
         // Create a BlockEmitter for this block
         let mut emitter = LLBlockEmitter::new(&mut ll_func, llssa, ll_block_id);
+
+        // Materialize array constants in the entry block, which dominates all uses (including the
+        // RC ops RCInsertion placed around them). Do this before lowering the block's own
+        // instructions so the materialized values are available in `val_map`.
+        if block_id == hl_entry_id {
+            for vid in &array_const_vids {
+                let c = constants.get(vid).expect("vid is in constants");
+                let arr = materialize_array_constant(&mut emitter, c.as_ref());
+                val_map.insert(*vid, arr);
+            }
+        }
 
         // Lower instructions
         for instruction in block.get_instructions() {
@@ -4082,5 +4170,90 @@ mod tests {
             "felt constant should not lower to an MkStruct instruction:\n{dump}"
         );
         assert_eq!(val_map.len(), 1, "the felt constant should be mapped");
+    }
+
+    /// A scalar array constant materializes as a heap-allocated, reference-counted array (RC = 1),
+    /// exactly like a `MkSeq` would — not as a native LLSSA constant.
+    #[test]
+    fn array_constant_materializes_to_heap_array() {
+        let c = Constant::Array {
+            elem_type: HLType::field(),
+            elems: vec![
+                Constant::Field(ark_bn254::Fr::from(1u64)),
+                Constant::Field(ark_bn254::Fr::from(2u64)),
+                Constant::Field(ark_bn254::Fr::from(3u64)),
+            ],
+        };
+
+        let mut llssa = LLSSA::with_main("arr_test".to_string());
+        let main_id = llssa.get_main_id();
+        let mut sb = LLSSABuilder::new(&mut llssa);
+        sb.modify_function(main_id, |fb| {
+            let entry = fb.function.get_entry_id();
+            let mut e = fb.block(entry);
+            let _arr = materialize_array_constant(&mut e, &c);
+            e.terminate_return(vec![]);
+        });
+
+        let dump = llssa.to_string(&DefaultSSAAnnotator);
+        assert!(
+            dump.contains("heap_alloc"),
+            "expected a heap allocation:\n{dump}"
+        );
+        assert!(
+            dump.contains("store"),
+            "expected header/element stores:\n{dump}"
+        );
+        // RC initialized to 1 (mirrors lower_mk_array).
+        assert!(
+            dump.contains("Int { bits: 64, value: 1 }"),
+            "expected RC initialized to 1:\n{dump}"
+        );
+        // table_id initialized to the u64::MAX "unassigned" sentinel.
+        assert!(
+            dump.contains("18446744073709551615"),
+            "expected unassigned table_id sentinel:\n{dump}"
+        );
+        // A flat array is a single allocation.
+        assert_eq!(
+            dump.matches("heap_alloc").count(),
+            1,
+            "flat array should be exactly one allocation:\n{dump}"
+        );
+    }
+
+    /// A nested array constant (array-of-arrays) materializes recursively: one allocation per
+    /// inner array plus one for the outer, with inner pointers stored into the outer array.
+    #[test]
+    fn nested_array_constant_materializes_recursively() {
+        let inner = |a: u64, b: u64| Constant::Array {
+            elem_type: HLType::field(),
+            elems: vec![
+                Constant::Field(ark_bn254::Fr::from(a)),
+                Constant::Field(ark_bn254::Fr::from(b)),
+            ],
+        };
+        let c = Constant::Array {
+            elem_type: HLType::field().array_of(2),
+            elems: vec![inner(1, 2), inner(3, 4)],
+        };
+
+        let mut llssa = LLSSA::with_main("nested_arr_test".to_string());
+        let main_id = llssa.get_main_id();
+        let mut sb = LLSSABuilder::new(&mut llssa);
+        sb.modify_function(main_id, |fb| {
+            let entry = fb.function.get_entry_id();
+            let mut e = fb.block(entry);
+            let _arr = materialize_array_constant(&mut e, &c);
+            e.terminate_return(vec![]);
+        });
+
+        let dump = llssa.to_string(&DefaultSSAAnnotator);
+        // Two inner arrays + one outer array = three allocations.
+        assert_eq!(
+            dump.matches("heap_alloc").count(),
+            3,
+            "nested 2x[Field;2] should allocate three arrays:\n{dump}"
+        );
     }
 }

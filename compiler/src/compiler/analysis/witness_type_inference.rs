@@ -302,6 +302,10 @@ impl WitnessTypeInference {
                 Constant::U(_, _) | Constant::I(_, _) | Constant::Field(_) | Constant::FnPtr(_) => {
                     WitnessShape::Scalar(WitnessType::Pure)
                 }
+                // A constant arrays cannot hold witness data.
+                Constant::Array { elem_type, elems } => {
+                    Self::construct_pure_witness_for_type(&elem_type.clone().array_of(elems.len()))
+                }
             };
             value_wt.insert(*vid, shape);
         });
