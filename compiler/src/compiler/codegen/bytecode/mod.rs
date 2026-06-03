@@ -26,11 +26,12 @@ use crate::{
 /// Materialize every constant `ValueId` referenced by `function` into the function's frame at
 /// entry.
 ///
-/// This can likely be improved in the future by handling constants specially in the VM, but for now
-/// this is the simplest solution that maintains semantic correctness.
+/// This only handles materialization of value constants, with heap-based constants handled via the
+/// `const_pool`.
 fn materialize_constants(
     function: &HLFunction,
     constants: &HLSSAConstantsSnapshot,
+    const_pool: &mut ConstPool,
     layouter: &mut FrameLayouter,
     emitter: &mut EmitterState,
 ) {
@@ -68,19 +69,36 @@ fn materialize_constants(
 
     for vid in referenced {
         let constant = constants.get(&vid).expect("vid is in constants");
-        let pos = materialize_const_value(constant.as_ref(), layouter, emitter);
-        // Bind the constant's `ValueId` to its frame slot. (For scalars this matches the old
-        // `alloc_int`/`alloc_field`, which inserted the same mapping.)
-        layouter.variables.insert(vid, pos.0);
+        match constant.as_ref() {
+            // Heap (array) constants are materialized once into the shared immortal constant table;
+            // every function just loads the shared pointer. This is what gives constant arrays a
+            // single identity (one heap object, one lookup table) instead of one copy per function.
+            hlssa::Constant::Array { .. } => {
+                let const_id = const_pool.register(constant.as_ref());
+                let res =
+                    layouter.alloc_scratch(crate::compiler::codegen::constants::POINTER_SIZE_CELLS);
+                emitter.push_op(bytecode::OpCode::LoadConst { res, const_id });
+                layouter.variables.insert(vid, res.0);
+            }
+            // Scalar constants stay inline immediates (no identity to share).
+            _ => {
+                let pos = materialize_const_value(constant.as_ref(), layouter, emitter);
+                // Bind the constant's `ValueId` to its frame slot. (For scalars this matches the
+                // old `alloc_int`/`alloc_field`, which inserted the same mapping.)
+                layouter.variables.insert(vid, pos.0);
+            }
+        }
     }
 }
 
 /// Recursively materialize a single constant into a freshly allocated frame slot and return its
-/// position. Array constants materialize each element first (anonymous slots; nested arrays
-/// recurse, inner arrays first) and then heap-allocate the array via `ArrayAlloc`, mirroring the
-/// `MkSeq` lowering. The VM initializes the allocation's refcount to 1, so the RCInsertion pass
-/// balances shared uses exactly as it does for a runtime `MkSeq` result — `ArraySet` therefore
-/// copies before mutating a shared constant array (see `lower_array_set` / RCInsertion).
+/// position.
+///
+/// Array constants materialize each element first (anonymous slots; nested arrays recurse, inner
+/// arrays first) and then heap-allocate the array via `ArrayAlloc`, mirroring the `MkSeq` lowering.
+/// The VM initializes the allocation's refcount to 1, so the RCInsertion pass balances shared uses
+/// exactly as it does for a runtime `MkSeq` result — `ArraySet` therefore copies before mutating a
+/// shared constant array (see `lower_array_set` / RCInsertion).
 fn materialize_const_value(
     c: &hlssa::Constant,
     layouter: &mut FrameLayouter,
@@ -147,11 +165,80 @@ fn materialize_const_value(
             emitter.push_op(bytecode::OpCode::ArrayAlloc {
                 res,
                 stride,
-                meta: vm::array::BoxedLayout::array(elems.len() * stride, is_ptr),
+                meta: vm::layout::BoxedLayout::array(elems.len() * stride, is_ptr),
                 items,
             });
             res
         }
+    }
+}
+
+/// The raw u64 words a scalar constant occupies in a `PrimArray` element slot of `stride` cells.
+fn scalar_const_words(c: &hlssa::Constant, stride: usize) -> Vec<u64> {
+    let mut words = match c {
+        hlssa::Constant::Field(val) => val.0.0.to_vec(),
+        hlssa::Constant::U(_, val) => {
+            let mut w = vec![*val as u64];
+            if stride > 1 {
+                w.push((*val >> 64) as u64);
+            }
+            w
+        }
+        hlssa::Constant::I(_, val) => vec![*val as u64],
+        other => panic!("non-scalar constant {other:?} as PrimArray element"),
+    };
+    words.resize(stride, 0);
+    words
+}
+
+/// Program-wide registry that materialises each unique heap constant exactly once into the
+/// bytecode's constant table, deduplicating structurally-equal constants (including nested arrays
+/// shared across constants).
+///
+/// Heap constants are those that undergo reference counting, rather than the scalars which can
+/// still be emitted inline.
+///
+/// Descriptors are emitted inner-before-outer, so a parent's child ids always reference
+/// already-registered entries.
+#[derive(Default)]
+struct ConstPool {
+    by_value: HashMap<hlssa::Constant, usize>,
+    descriptors: Vec<bytecode::ConstDescriptor>,
+}
+
+impl ConstPool {
+    /// Register a heap constant and return its const-id, recursively registering children.
+    fn register(&mut self, c: &hlssa::Constant) -> usize {
+        if let Some(&id) = self.by_value.get(c) {
+            return id;
+        }
+        let hlssa::Constant::Array { elem_type, elems } = c else {
+            panic!("ICE: only heap constants are pooled for now; got {c:?}");
+        };
+        let descriptor = if elem_type.is_heap_allocated() {
+            let child_ids: Vec<u64> = elems.iter().map(|e| self.register(e) as u64).collect();
+            bytecode::ConstDescriptor {
+                layout: vm::layout::BoxedLayout::array(
+                    elems.len() * crate::compiler::codegen::constants::POINTER_SIZE_CELLS,
+                    true,
+                ),
+                payload: child_ids,
+            }
+        } else {
+            let stride = layout::type_size(elem_type);
+            let mut payload = Vec::with_capacity(elems.len() * stride);
+            for e in elems {
+                payload.extend(scalar_const_words(e, stride));
+            }
+            bytecode::ConstDescriptor {
+                layout: vm::layout::BoxedLayout::array(elems.len() * stride, false),
+                payload,
+            }
+        };
+        let id = self.descriptors.len();
+        self.descriptors.push(descriptor);
+        self.by_value.insert(c.clone(), id);
+        id
     }
 }
 
@@ -169,6 +256,7 @@ impl CodeGen {
     pub fn run(&self, ssa: &HLSSA, cfg: &FlowAnalysis, type_info: &TypeInfo) -> bytecode::Program {
         let global_layouter = GlobalFrameLayouter::new(ssa);
         let mut struct_interner = StructLayoutInterner::new();
+        let mut const_pool = ConstPool::default();
         let constants = ssa.const_snapshot();
 
         let function = ssa.get_main();
@@ -178,6 +266,7 @@ impl CodeGen {
             type_info.get_function(ssa.get_main_id()),
             &global_layouter,
             &mut struct_interner,
+            &mut const_pool,
             &constants,
         );
 
@@ -198,6 +287,7 @@ impl CodeGen {
                 type_info.get_function(*function_id),
                 &global_layouter,
                 &mut struct_interner,
+                &mut const_pool,
                 &constants,
             );
             function_ids.insert(*function_id, cur_fn_begin);
@@ -229,6 +319,7 @@ impl CodeGen {
             functions,
             global_frame_size: global_layouter.total_size,
             struct_layouts: struct_interner.into_table(),
+            constants: const_pool.descriptors,
         }
     }
 
@@ -239,6 +330,7 @@ impl CodeGen {
         type_info: &FunctionTypeInfo,
         global_layouter: &GlobalFrameLayouter,
         struct_interner: &mut StructLayoutInterner,
+        const_pool: &mut ConstPool,
         constants: &HLSSAConstantsSnapshot,
     ) -> bytecode::Function {
         let mut layouter = FrameLayouter::new();
@@ -251,8 +343,7 @@ impl CodeGen {
             layouter.alloc_value(*param, tp);
         }
 
-        // TODO: Deal with constants better in the bytecode (#201)
-        materialize_constants(function, constants, &mut layouter, &mut emitter);
+        materialize_constants(function, constants, const_pool, &mut layouter, &mut emitter);
 
         self.run_block_body(
             function,
@@ -1073,7 +1164,7 @@ impl CodeGen {
                     emitter.push_op(bytecode::OpCode::ArrayAlloc {
                         res,
                         stride: layouter.type_size(eltype),
-                        meta: vm::array::BoxedLayout::array(args.len() * stride, is_ptr),
+                        meta: vm::layout::BoxedLayout::array(args.len() * stride, is_ptr),
                         items: args,
                     });
                 }
@@ -1091,7 +1182,7 @@ impl CodeGen {
                     emitter.push_op(bytecode::OpCode::ArrayAllocRepeated {
                         res,
                         stride,
-                        meta: vm::array::BoxedLayout::array(*count * stride, is_ptr),
+                        meta: vm::layout::BoxedLayout::array(*count * stride, is_ptr),
                         count: *count,
                         item,
                     });
@@ -1118,7 +1209,7 @@ impl CodeGen {
                     let idx = struct_interner.intern(field_layout);
                     emitter.push_op(bytecode::OpCode::TupleAlloc {
                         res,
-                        meta: vm::array::BoxedLayout::new_struct(idx),
+                        meta: vm::layout::BoxedLayout::new_struct(idx),
                         fields,
                     });
                 }
@@ -1578,7 +1669,7 @@ impl CodeGen {
                     let res = layouter.alloc_ptr(*result);
                     let elem_size = layouter.type_size(elem_type);
                     let elem_rc = elem_type.is_heap_allocated();
-                    let meta = vm::array::BoxedLayout::ref_cell(elem_size, elem_rc);
+                    let meta = vm::layout::BoxedLayout::ref_cell(elem_size, elem_rc);
                     emitter.push_op(bytecode::OpCode::RefAlloc { res, meta });
                 }
                 hlssa::OpCode::Store { ptr, value } => {

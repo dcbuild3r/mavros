@@ -4,10 +4,10 @@ use crate::{ConstraintsLayout, Field, WitnessLayout};
 use ark_ff::{AdditiveGroup as _, BigInteger as _, Field as _};
 use mavros_opcode_gen::interpreter;
 
-use crate::array::{BoxedLayout, BoxedValue, StructDescriptor};
 use crate::interpreter::{Frame, Handler};
+use crate::layout::{BoxedLayout, BoxedValue, StructDescriptor};
 
-use crate::array::DataType;
+use crate::layout::DataType;
 use std::fmt::Display;
 use std::ptr;
 
@@ -359,6 +359,16 @@ pub struct VM {
     pub spread_tables: [Option<usize>; 17],
     pub globals: *mut u64,
     pub struct_layouts: Vec<StructDescriptor>,
+
+    /// The program's shared constant table.
+    ///
+    /// Each entry is an immortal boxed value that is materialized once at VM startup and is
+    /// referenced using the `LoadConst` opcode.
+    ///
+    /// It is currently only used for heap-allocated constants as materializing scalar constants
+    /// in-line yields better performance for only a small increase in bytecode size over keeping
+    /// all constants in the table. This mirrors the behavior seen downstream in the LLSSA backends.
+    pub constants: Vec<BoxedValue>,
 }
 
 impl VM {
@@ -398,6 +408,7 @@ impl VM {
             spread_tables: [None; 17],
             globals,
             struct_layouts,
+            constants: vec![],
         }
     }
 
@@ -435,6 +446,7 @@ impl VM {
             spread_tables: [None; 17],
             globals,
             struct_layouts,
+            constants: vec![],
         }
     }
 
@@ -695,6 +707,14 @@ mod def {
     #[opcode]
     fn mov_frame(frame: Frame, target: FramePosition, source: FramePosition, size: usize) {
         frame.memcpy(target.0 as isize, source.0 as isize, size);
+    }
+
+    /// Load a shared (immortal) constant's pointer from the constant table into the frame.
+    #[opcode]
+    fn load_const(#[out] res: *mut BoxedValue, const_id: usize, vm: &mut VM) {
+        unsafe {
+            *res = vm.constants[const_id];
+        }
     }
 
     #[opcode]
@@ -1208,7 +1228,13 @@ mod def {
         let target = new_array.array_idx(index as usize, stride);
         if new_array.layout().data_type() == DataType::BoxedArray {
             if new_array.0 == array.0 {
-                // if we're reusing the array, the old element needs to be garbage collected
+                // if we're reusing the array, the old element needs to be garbage collected.
+                // An immortal constant must never be reused in place (copy_if_reused always copies
+                // it, since its refcount sentinel is != 1), so this branch is unreachable for one.
+                debug_assert!(
+                    !array.is_immortal(),
+                    "array_set must never mutate an immortal constant in place"
+                );
                 let old_elem = unsafe { *(target as *mut BoxedValue) };
                 old_elem.dec_rc(vm);
             } else {
@@ -1976,10 +2002,26 @@ impl Display for Function {
     }
 }
 
+/// A single entry in the program's shared constant table.
+///
+/// Each heap constant (array) is materialised exactly once, at VM startup, into an immortal
+/// `BoxedValue`. A descriptor captures the shape needed to rebuild it:
+/// - `layout` is the `BoxedLayout` used to allocate it (encodes data-type + payload word count).
+/// - For a `PrimArray` (scalar elements), `payload` is the raw element words.
+/// - For a `BoxedArray` (heap elements), `payload` holds the *const-ids* of the child constants,
+///   one per element. Children always have a smaller id (the table is ordered inner-before-outer),
+///   so they are already built when a parent references them.
+#[derive(Clone, Debug)]
+pub struct ConstDescriptor {
+    pub layout: BoxedLayout,
+    pub payload: Vec<u64>,
+}
+
 pub struct Program {
     pub functions: Vec<Function>,
     pub global_frame_size: usize,
     pub struct_layouts: Vec<StructDescriptor>,
+    pub constants: Vec<ConstDescriptor>,
 }
 
 impl Display for Program {
@@ -2032,6 +2074,14 @@ impl Program {
             }
         }
 
+        // Constant table: [num_consts, (layout, payload_len, ...payload...) * num_consts].
+        binary.push(self.constants.len() as u64);
+        for c in &self.constants {
+            binary.push(c.layout.0);
+            binary.push(c.payload.len() as u64);
+            binary.extend_from_slice(&c.payload);
+        }
+
         binary.push(self.global_frame_size as u64);
         let mut positions = vec![];
         let mut jumps_to_fix: Vec<(usize, isize)> = vec![];
@@ -2074,4 +2124,85 @@ pub fn parse_struct_layouts(program: &[u64]) -> (Vec<StructDescriptor>, usize) {
         layouts.push(StructDescriptor::new(fields));
     }
     (layouts, off)
+}
+
+/// Read the constant table that immediately follows the struct-layout table. `off` is the offset
+/// returned by [`parse_struct_layouts`]. Returns the descriptors and the offset at which the rest
+/// of the program (starting with `global_frame_size`) begins.
+pub fn parse_constants(program: &[u64], mut off: usize) -> (Vec<ConstDescriptor>, usize) {
+    let num_consts = program[off] as usize;
+    off += 1;
+    let mut constants = Vec::with_capacity(num_consts);
+    for _ in 0..num_consts {
+        let layout = BoxedLayout(program[off]);
+        off += 1;
+        let payload_len = program[off] as usize;
+        off += 1;
+        let payload = program[off..off + payload_len].to_vec();
+        off += payload_len;
+        constants.push(ConstDescriptor { layout, payload });
+    }
+    (constants, off)
+}
+
+/// Build the immortal constant table from its descriptors. Descriptors are ordered inner-before-outer,
+/// so a `BoxedArray`'s child const-ids always refer to already-built entries.
+pub fn build_constants(descriptors: &[ConstDescriptor], vm: &mut VM) -> Vec<BoxedValue> {
+    let mut consts: Vec<BoxedValue> = Vec::with_capacity(descriptors.len());
+    for d in descriptors {
+        let bv = BoxedValue::alloc_immortal(d.layout, vm);
+        if d.layout.is_boxed_array() {
+            // Each payload entry is a child const-id; write its (already-built) pointer.
+            for (i, &child_id) in d.payload.iter().enumerate() {
+                let slot = bv.array_idx(i, 1) as *mut BoxedValue;
+                unsafe { *slot = consts[child_id as usize] };
+            }
+        } else {
+            // Raw element words copied verbatim into the payload.
+            let data = bv.data();
+            for (i, &word) in d.payload.iter().enumerate() {
+                unsafe { *data.add(i) = word };
+            }
+        }
+        consts.push(bv);
+    }
+    consts
+}
+
+#[cfg(test)]
+mod const_section_tests {
+    use super::*;
+
+    #[test]
+    fn parse_constants_round_trip() {
+        // Two descriptors: a PrimArray (raw words) and a BoxedArray (child const-ids).
+        let descriptors = vec![
+            ConstDescriptor {
+                layout: BoxedLayout::array(3, false),
+                payload: vec![10, 20, 30],
+            },
+            ConstDescriptor {
+                layout: BoxedLayout::array(1, true),
+                payload: vec![0],
+            },
+        ];
+        // Serialize exactly as `Program::to_binary` does for the constant section, preceded by a
+        // sentinel to confirm `parse_constants` honors the starting offset.
+        let mut binary = vec![0xDEADu64];
+        binary.push(descriptors.len() as u64);
+        for d in &descriptors {
+            binary.push(d.layout.0);
+            binary.push(d.payload.len() as u64);
+            binary.extend_from_slice(&d.payload);
+        }
+        binary.push(0xBEEF); // stands in for the following `global_frame_size` word
+
+        let (parsed, off) = parse_constants(&binary, 1);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].layout.0, BoxedLayout::array(3, false).0);
+        assert_eq!(parsed[0].payload, vec![10, 20, 30]);
+        assert!(parsed[1].layout.is_boxed_array());
+        assert_eq!(parsed[1].payload, vec![0]);
+        assert_eq!(binary[off], 0xBEEF, "offset must land on the next section");
+    }
 }

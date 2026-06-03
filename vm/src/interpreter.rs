@@ -10,11 +10,11 @@ use tracing::instrument;
 
 pub use crate::InputValueOrdered;
 
-use crate::bytecode::parse_struct_layouts;
+use crate::bytecode::{build_constants, parse_constants, parse_struct_layouts};
 use crate::{
     ConstraintsLayout, Field, WitnessLayout,
-    array::BoxedValue,
     bytecode::{self, AllocationInstrumenter, AllocationType, OpCode, TableInfo, U128, VM},
+    layout::BoxedValue,
 };
 
 /// An opcode handler. Returns the `(pc, frame)` to feed into the next
@@ -259,9 +259,8 @@ fn fix_multiplicities_section(wit: &mut [Field], witness_layout: WitnessLayout) 
     }
 }
 
-/// Phase 1 of witness generation: executes the VM to produce the
-/// pre-commitment witness and captures all intermediate state needed for
-/// phase 2.
+/// Phase 1 of witness generation: executes the VM to produce the pre-commitment witness and
+/// captures all intermediate state needed for phase 2.
 #[instrument(skip_all, name = "Interpreter::run_phase1")]
 pub fn run_phase1(
     program: &[u64],
@@ -269,7 +268,8 @@ pub fn run_phase1(
     constraints_layout: ConstraintsLayout,
     ordered_inputs: &[InputValueOrdered],
 ) -> Phase1Result {
-    let (struct_layouts, code_start) = parse_struct_layouts(program);
+    let (struct_layouts, after_structs) = parse_struct_layouts(program);
+    let (const_descriptors, code_start) = parse_constants(program, after_structs);
     let global_frame_size = program[code_start] as usize;
     let mut out_a = vec![Field::ZERO; constraints_layout.size()];
     let mut out_b = vec![Field::ZERO; constraints_layout.size()];
@@ -309,6 +309,7 @@ pub fn run_phase1(
         global_frame.as_mut_ptr(),
         struct_layouts,
     );
+    vm.constants = build_constants(&const_descriptors, &mut vm);
 
     let frame = Frame::base_frame(program[code_start + 2], &mut vm);
 
@@ -618,7 +619,8 @@ pub fn run_ad(
     witness_layout: WitnessLayout,
     constraints_layout: ConstraintsLayout,
 ) -> (Vec<Field>, Vec<Field>, Vec<Field>, AllocationInstrumenter) {
-    let (struct_layouts, code_start) = parse_struct_layouts(program);
+    let (struct_layouts, after_structs) = parse_struct_layouts(program);
+    let (const_descriptors, code_start) = parse_constants(program, after_structs);
     let global_frame_size = program[code_start] as usize;
     let mut out_da = vec![Field::ZERO; witness_layout.size()];
     let mut out_db = vec![Field::ZERO; witness_layout.size()];
@@ -634,6 +636,7 @@ pub fn run_ad(
         global_frame.as_mut_ptr(),
         struct_layouts,
     );
+    vm.constants = build_constants(&const_descriptors, &mut vm);
 
     let frame = Frame::push(
         program[code_start + 2],

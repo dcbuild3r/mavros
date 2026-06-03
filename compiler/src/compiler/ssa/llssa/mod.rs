@@ -27,7 +27,7 @@ pub type LLSSA = SSA<LLOp, Type, Constant>;
 ///
 /// The word used to track the refcount for that object should be set to this value, and every
 /// refcount operation should check for this value before attempting to modify the refcount.
-pub const RC_IMMORTAL_OBJECT: u64 = u64::MAX;
+pub use mavros_vm::layout::RC_IMMORTAL_OBJECT;
 
 /// The size of the refcount in bytes.
 pub const RC_SIZE_BYTES: usize = 8;
