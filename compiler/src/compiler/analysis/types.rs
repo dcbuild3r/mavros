@@ -349,13 +349,14 @@ impl Types {
                     .get(value)
                     .ok_or_else(|| format!("Value {:?} not found in type assignments", value))?;
 
-                // If the value is witness-typed but the array element is not,
-                // promote the result array's element type to match.
+                // If the assigned value has witness-typed leaves, promote the
+                // result array element recursively to preserve that shape.
                 let elem_type = array_type.get_array_element();
-                let result_type = if value_type.is_witness_of() && !elem_type.is_witness_of() {
+                let result_elem_type = Type::join(&elem_type, value_type);
+                let result_type = if result_elem_type != elem_type {
                     match &array_type.expr {
-                        TypeExpr::Array(_, size) => value_type.clone().array_of(*size),
-                        TypeExpr::Slice(_) => value_type.clone().slice_of(),
+                        TypeExpr::Array(_, size) => result_elem_type.array_of(*size),
+                        TypeExpr::Slice(_) => result_elem_type.slice_of(),
                         _ => array_type.clone(),
                     }
                 } else {
