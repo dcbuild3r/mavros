@@ -727,16 +727,28 @@ fn materialize_constants<V, Ctx>(ssa: &HLSSA, ctx: &mut Ctx) -> HashMap<ValueId,
 where
     V: Value<Ctx>,
 {
+    // Dedup identical heap constants by structural value so every reference path resolves to one
+    // materialized value `V`.
+    //
+    // This includes deduplication of heap constants nested within heap constants.
+    let mut memo: HashMap<Constant, V> = HashMap::new();
     let mut consts = HashMap::new();
     for (vid, cv) in ssa.const_snapshot() {
-        let v = materialize_const_value::<V, Ctx>(cv.as_ref(), ctx);
+        let v = materialize_const_value::<V, Ctx>(cv.as_ref(), ctx, &mut memo);
         consts.insert(vid, v);
     }
     consts
 }
 
 /// Recursively materialize a single constant into a `V`, bottom up.
-fn materialize_const_value<V, Ctx>(c: &Constant, ctx: &mut Ctx) -> V
+///
+/// `memo` caches array constants by structural value so identical (sub-)arrays share one
+/// materialized `V`.
+fn materialize_const_value<V, Ctx>(
+    c: &Constant,
+    ctx: &mut Ctx,
+    memo: &mut HashMap<Constant, V>,
+) -> V
 where
     V: Value<Ctx>,
 {
@@ -748,11 +760,16 @@ where
             todo!("FnPtrConst in symbolic executor");
         }
         Constant::Array { elem_type, elems } => {
+            if let Some(cached) = memo.get(c) {
+                return cached.clone();
+            }
             let vals = elems
                 .iter()
-                .map(|e| materialize_const_value::<V, Ctx>(e, ctx))
+                .map(|e| materialize_const_value::<V, Ctx>(e, ctx, memo))
                 .collect();
-            V::mk_array(vals, ctx, SequenceTargetType::Array(elems.len()), elem_type)
+            let v = V::mk_array(vals, ctx, SequenceTargetType::Array(elems.len()), elem_type);
+            memo.insert(c.clone(), v.clone());
+            v
         }
     }
 }
