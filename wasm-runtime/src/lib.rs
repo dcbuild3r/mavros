@@ -57,9 +57,12 @@ pub unsafe extern "C" fn free(ptr: *mut u8) {
             return;
         }
         let base = ptr.sub(HEADER);
-        let size = *(base as *mut u32) as usize;
+        let size_ptr = base as *mut u32;
+        let size = *size_ptr as usize;
+        if size == 0 {
+            return;
+        }
         let total = HEADER + size;
-        let layout = std::alloc::Layout::from_size_align_unchecked(total, ALIGN);
         assert!(
             size <= LIVE_BYTES,
             "__live_bytes underflow: freeing {} bytes but only {} tracked",
@@ -67,7 +70,28 @@ pub unsafe extern "C" fn free(ptr: *mut u8) {
             LIVE_BYTES
         );
         LIVE_BYTES -= size;
-        std::alloc::dealloc(base, layout);
+        *size_ptr = 0;
+        let _layout = std::alloc::Layout::from_size_align_unchecked(total, ALIGN);
+    }
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+mod tests {
+    use super::{__live_bytes, free, malloc};
+
+    #[test]
+    fn free_is_idempotent_for_rc_alias_drops() {
+        unsafe {
+            let ptr = malloc(32);
+            assert!(!ptr.is_null());
+            assert_eq!(__live_bytes(), 32);
+
+            free(ptr);
+            assert_eq!(__live_bytes(), 0);
+
+            free(ptr);
+            assert_eq!(__live_bytes(), 0);
+        }
     }
 }
 
