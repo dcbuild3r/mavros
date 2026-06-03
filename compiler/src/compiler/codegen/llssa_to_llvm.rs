@@ -1310,11 +1310,10 @@ impl<'ctx> LLVMCodeGen<'ctx> {
     fn build_wasm_runtime() -> std::path::PathBuf {
         use std::process::Command;
 
-        let metadata = cargo_metadata::MetadataCommand::new()
-            .exec()
-            .expect("Failed to get cargo metadata");
-
-        let workspace_root = metadata.workspace_root.as_std_path();
+        let compiler_manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let workspace_root = compiler_manifest_dir
+            .parent()
+            .expect("mavros compiler crate must live under the Mavros workspace root");
         let wasm_runtime_dir = workspace_root.join("wasm-runtime");
 
         let output = Command::new("cargo")
