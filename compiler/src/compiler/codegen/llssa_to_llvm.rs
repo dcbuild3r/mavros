@@ -1278,6 +1278,8 @@ impl<'ctx> LLVMCodeGen<'ctx> {
                 "-z",
                 &format!("stack-size={WASM_STACK_SIZE_BYTES}"),
                 "--export=__data_end",
+                "--export=malloc",
+                "--export=free",
                 "--export=__live_bytes",
                 "-o",
             ])
