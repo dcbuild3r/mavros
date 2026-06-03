@@ -67,58 +67,90 @@ fn materialize_constants(
     referenced.sort_by_key(|v| v.0);
 
     for vid in referenced {
-        match constants.get(&vid).expect("vid is in constants").as_ref() {
-            hlssa::Constant::U(size, val) => {
-                let res = layouter.alloc_int(vid, *size);
-                match size {
-                    bits if *bits <= 64 => {
-                        emitter.push_op(bytecode::OpCode::MovConst {
-                            res,
-                            val: *val as u64,
-                        });
-                    }
-                    128 => {
-                        emitter.push_op(bytecode::OpCode::MovConst {
-                            res,
-                            val: *val as u64,
-                        });
-                        emitter.push_op(bytecode::OpCode::MovConst {
-                            res: res.offset(1),
-                            val: (*val >> 64) as u64,
-                        });
-                    }
-                    bits => panic!("unsupported unsigned integer width: {bits}"),
-                }
-            }
-            hlssa::Constant::I(size, val) => {
-                assert!(
-                    *size <= MAX_SUPPORTED_SIGNED_BITS,
-                    "signed integers wider than i{MAX_SUPPORTED_SIGNED_BITS} are unsupported"
-                );
-                let res = layouter.alloc_int(vid, *size);
-                emitter.push_op(bytecode::OpCode::MovConst {
-                    res,
-                    val: *val as u64,
-                });
-            }
-            hlssa::Constant::Field(val) => {
-                let start = layouter.alloc_field(vid);
-                for i in 0..bytecode::FELT_LIMBS {
+        let constant = constants.get(&vid).expect("vid is in constants");
+        let pos = materialize_const_value(constant.as_ref(), layouter, emitter);
+        // Bind the constant's `ValueId` to its frame slot. (For scalars this matches the old
+        // `alloc_int`/`alloc_field`, which inserted the same mapping.)
+        layouter.variables.insert(vid, pos.0);
+    }
+}
+
+/// Recursively materialize a single constant into a freshly allocated frame slot and return its
+/// position. Array constants materialize each element first (anonymous slots; nested arrays
+/// recurse, inner arrays first) and then heap-allocate the array via `ArrayAlloc`, mirroring the
+/// `MkSeq` lowering. The VM initializes the allocation's refcount to 1, so the RCInsertion pass
+/// balances shared uses exactly as it does for a runtime `MkSeq` result — `ArraySet` therefore
+/// copies before mutating a shared constant array (see `lower_array_set` / RCInsertion).
+fn materialize_const_value(
+    c: &hlssa::Constant,
+    layouter: &mut FrameLayouter,
+    emitter: &mut EmitterState,
+) -> bytecode::FramePosition {
+    match c {
+        hlssa::Constant::U(size, val) => {
+            let res = layouter.alloc_scratch(layout::int_cell_count(*size));
+            match size {
+                bits if *bits <= 64 => {
                     emitter.push_op(bytecode::OpCode::MovConst {
-                        res: start.offset(i as isize),
-                        val: val.0.0[i],
+                        res,
+                        val: *val as u64,
                     });
                 }
+                128 => {
+                    emitter.push_op(bytecode::OpCode::MovConst {
+                        res,
+                        val: *val as u64,
+                    });
+                    emitter.push_op(bytecode::OpCode::MovConst {
+                        res: res.offset(1),
+                        val: (*val >> 64) as u64,
+                    });
+                }
+                bits => panic!("unsupported unsigned integer width: {bits}"),
             }
-            hlssa::Constant::FnPtr(_) => {
-                panic!("FnPtr constants not supported in codegen");
+            res
+        }
+        hlssa::Constant::I(size, val) => {
+            assert!(
+                *size <= MAX_SUPPORTED_SIGNED_BITS,
+                "signed integers wider than i{MAX_SUPPORTED_SIGNED_BITS} are unsupported"
+            );
+            let res = layouter.alloc_scratch(layout::int_cell_count(*size));
+            emitter.push_op(bytecode::OpCode::MovConst {
+                res,
+                val: *val as u64,
+            });
+            res
+        }
+        hlssa::Constant::Field(val) => {
+            let start = layouter.alloc_temp_field();
+            for i in 0..bytecode::FELT_LIMBS {
+                emitter.push_op(bytecode::OpCode::MovConst {
+                    res: start.offset(i as isize),
+                    val: val.0.0[i],
+                });
             }
-            hlssa::Constant::Array { .. } => {
-                // The bytecode backend does not yet materialize array constants; this is deferred
-                // alongside routing the frontend to produce them. The HLSSA->LLSSA path handles
-                // them today (see materialize_array_constant).
-                todo!("array constants in bytecode backend — deferred with frontend");
-            }
+            start
+        }
+        hlssa::Constant::FnPtr(_) => {
+            panic!("FnPtr constants not supported in codegen");
+        }
+        hlssa::Constant::Array { elem_type, elems } => {
+            let items = elems
+                .iter()
+                .map(|e| materialize_const_value(e, layouter, emitter))
+                .collect::<Vec<_>>();
+            let is_ptr = elem_type.is_heap_allocated();
+            let stride = layouter.type_size(elem_type);
+            let res =
+                layouter.alloc_scratch(crate::compiler::codegen::constants::POINTER_SIZE_CELLS);
+            emitter.push_op(bytecode::OpCode::ArrayAlloc {
+                res,
+                stride,
+                meta: vm::array::BoxedLayout::array(elems.len() * stride, is_ptr),
+                items,
+            });
+            res
         }
     }
 }

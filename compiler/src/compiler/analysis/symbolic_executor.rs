@@ -729,20 +729,30 @@ where
 {
     let mut consts = HashMap::new();
     for (vid, cv) in ssa.const_snapshot() {
-        let v = match cv.as_ref() {
-            Constant::U(size, val) => V::of_u(*size, *val, ctx),
-            Constant::I(size, val) => V::of_i(*size, *val, ctx),
-            Constant::Field(val) => V::of_field(*val, ctx),
-            Constant::FnPtr(_) => {
-                todo!("FnPtrConst in symbolic executor");
-            }
-            Constant::Array { .. } => {
-                // Array constants are only produced once the frontend routes constant array
-                // literals to them; the symbolic executor will need real aggregate support then.
-                todo!("array constants in symbolic executor");
-            }
-        };
+        let v = materialize_const_value::<V, Ctx>(cv.as_ref(), ctx);
         consts.insert(vid, v);
     }
     consts
+}
+
+/// Recursively materialize a single constant into a `V`, bottom up.
+fn materialize_const_value<V, Ctx>(c: &Constant, ctx: &mut Ctx) -> V
+where
+    V: Value<Ctx>,
+{
+    match c {
+        Constant::U(size, val) => V::of_u(*size, *val, ctx),
+        Constant::I(size, val) => V::of_i(*size, *val, ctx),
+        Constant::Field(val) => V::of_field(*val, ctx),
+        Constant::FnPtr(_) => {
+            todo!("FnPtrConst in symbolic executor");
+        }
+        Constant::Array { elem_type, elems } => {
+            let vals = elems
+                .iter()
+                .map(|e| materialize_const_value::<V, Ctx>(e, ctx))
+                .collect();
+            V::mk_array(vals, ctx, SequenceTargetType::Array(elems.len()), elem_type)
+        }
+    }
 }
