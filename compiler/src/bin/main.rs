@@ -183,6 +183,12 @@ pub fn run(args: &ProgramOptions) -> Result<ExitCode, Error> {
         driver
             .compile_llvm_targets(args.emit_llvm, &r1cs, wasm_config)
             .unwrap();
+
+        if args.emit_wasm {
+            let ad_wasm_path = driver.get_debug_output_dir().join("ad.wasm");
+            info!(message = %"Generating AD WebAssembly", path = %ad_wasm_path.display());
+            driver.compile_ad_llvm_targets(ad_wasm_path, &r1cs).unwrap();
+        }
     }
 
     // Skip VM execution if requested

@@ -433,10 +433,12 @@ impl WitnessLowering {
                         | OpCode::DropGlobal { .. }
                         | OpCode::TupleProj { .. }
                         | OpCode::Todo { .. }
-                        | OpCode::ValueOf { .. }
                         | OpCode::Spread { .. }
                         | OpCode::Unspread { .. } => {
                             emitter.emit(instruction);
+                        }
+                        OpCode::ValueOf { result, value } => {
+                            replacements.insert(result, value);
                         }
                         OpCode::MkTuple {
                             result,
@@ -501,6 +503,13 @@ impl WitnessLowering {
             (TypeExpr::Field, TypeExpr::WitnessOf(_))
             | (TypeExpr::U(_), TypeExpr::WitnessOf(_))
             | (TypeExpr::I(_), TypeExpr::WitnessOf(_)) => emitter.cast_to_witness_of(value),
+            (TypeExpr::WitnessOf(inner), TypeExpr::Field)
+            | (TypeExpr::WitnessOf(inner), TypeExpr::U(_))
+            | (TypeExpr::WitnessOf(inner), TypeExpr::I(_))
+                if inner.as_ref() == target_type =>
+            {
+                value
+            }
             (TypeExpr::Array(src_inner, src_size), TypeExpr::Array(tgt_inner, tgt_size)) => {
                 assert_eq!(
                     src_size, tgt_size,

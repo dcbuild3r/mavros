@@ -10,13 +10,15 @@ use crate::{
             flow_analysis::{CFG, FlowAnalysis},
             types::{FunctionTypeInfo, TypeInfo},
         },
-        codegen::bytecode::layout::{FrameLayouter, GlobalFrameLayouter, StructLayoutInterner},
+        codegen::bytecode::layout::{
+            FrameLayouter, GlobalFrameLayouter, StructLayoutInterner, int_cell_count,
+        },
         ssa::{
             BlockId, FunctionId, Instruction, Terminator, ValueId,
             hlssa::{
                 self, BinaryArithOpKind, CmpKind, DMatrix, Endianness, HLBlock, HLFunction, HLSSA,
-                HLSSAConstantsSnapshot, LookupTarget, MAX_SUPPORTED_SIGNED_BITS, Radix, RefCountOp,
-                Type, TypeExpr,
+                HLSSAConstantsSnapshot, LookupTarget, MAX_SUPPORTED_SIGNED_BITS,
+                MAX_SUPPORTED_UNSIGNED_BITS, Radix, RefCountOp, Type, TypeExpr,
             },
         },
     },
@@ -1270,6 +1272,24 @@ impl CodeGen {
                     })
                 }
                 hlssa::OpCode::ToRadix {
+                    result: r,
+                    value: v,
+                    radix: Radix::Bytes,
+                    endianness: Endianness::Little,
+                    count: c,
+                } => {
+                    assert!(
+                        type_info.get_value_type(*v).is_field(),
+                        "TODO: Implement toRadix for U-values"
+                    );
+                    assert!(*c <= 32, "ToRadix byte count must be <= 32");
+                    emitter.push_op(bytecode::OpCode::ToBytesLe {
+                        val: layouter.get_value(*v),
+                        count: *c as u64,
+                        res: layouter.alloc_value(*r, &type_info.get_value_type(*r)),
+                    })
+                }
+                hlssa::OpCode::ToRadix {
                     result: _,
                     value: v,
                     radix,
@@ -1649,10 +1669,14 @@ fn lookup_elem_kind(elem_type: &Type) -> (usize, usize) {
         TypeExpr::Field => (bytecode::FELT_LIMBS, bytecode::ELEM_FIELD),
         TypeExpr::U(bits) => {
             assert!(
-                *bits <= 64,
-                "Array lookup unsupported for {elem_type} (>64 bits)"
+                *bits <= MAX_SUPPORTED_UNSIGNED_BITS,
+                "Array lookup unsupported for {elem_type} (>128 bits)"
             );
-            (1, bytecode::ELEM_WORD)
+            if *bits <= 64 {
+                (1, bytecode::ELEM_WORD)
+            } else {
+                (int_cell_count(*bits), bytecode::ELEM_U128)
+            }
         }
         TypeExpr::I(bits) => {
             assert!(
@@ -1670,6 +1694,21 @@ fn lookup_elem_kind(elem_type: &Type) -> (usize, usize) {
             (1, bytecode::ELEM_WITNESS)
         }
         TypeExpr::Array(inner, _) | TypeExpr::Slice(inner) => lookup_elem_kind(inner),
+        TypeExpr::Tuple(fields) => {
+            let mut fields = fields.iter();
+            let first = fields
+                .next()
+                .map(lookup_elem_kind)
+                .expect("lookup tuple element must not be empty");
+            for field in fields {
+                let field_kind = lookup_elem_kind(field);
+                assert_eq!(
+                    field_kind, first,
+                    "Array lookup tuple leaves must have homogeneous representation"
+                );
+            }
+            first
+        }
         _ => panic!("Unsupported array element type in lookup: {elem_type}"),
     }
 }

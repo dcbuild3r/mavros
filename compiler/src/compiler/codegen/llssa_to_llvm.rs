@@ -742,17 +742,52 @@ impl<'ctx> LLVMCodeGen<'ctx> {
             }
 
             LLOp::IntCmp { kind, result, a, b } => {
-                let lhs = self.value_map[a].into_int_value();
-                let rhs = self.value_map[b].into_int_value();
-                let predicate = match kind {
-                    IntCmpOp::Eq => IntPredicate::EQ,
-                    IntCmpOp::ULt => IntPredicate::ULT,
-                    IntCmpOp::SLt => IntPredicate::SLT,
+                let lhs = self.value_map[a];
+                let rhs = self.value_map[b];
+                let val = if lhs.is_pointer_value() || rhs.is_pointer_value() {
+                    assert!(
+                        matches!(kind, IntCmpOp::Eq),
+                        "only pointer equality comparisons are supported"
+                    );
+                    assert!(
+                        lhs.is_pointer_value() && rhs.is_pointer_value(),
+                        "pointer comparisons require two pointer operands"
+                    );
+                    let ptr_int_ty = self.context.i64_type();
+                    let lhs = self
+                        .builder
+                        .build_ptr_to_int(
+                            lhs.into_pointer_value(),
+                            ptr_int_ty,
+                            &format!("v{}_lhs_ptr", result.0),
+                        )
+                        .unwrap();
+                    let rhs = self
+                        .builder
+                        .build_ptr_to_int(
+                            rhs.into_pointer_value(),
+                            ptr_int_ty,
+                            &format!("v{}_rhs_ptr", result.0),
+                        )
+                        .unwrap();
+                    self.builder
+                        .build_int_compare(IntPredicate::EQ, lhs, rhs, &format!("v{}", result.0))
+                        .unwrap()
+                } else {
+                    let predicate = match kind {
+                        IntCmpOp::Eq => IntPredicate::EQ,
+                        IntCmpOp::ULt => IntPredicate::ULT,
+                        IntCmpOp::SLt => IntPredicate::SLT,
+                    };
+                    self.builder
+                        .build_int_compare(
+                            predicate,
+                            lhs.into_int_value(),
+                            rhs.into_int_value(),
+                            &format!("v{}", result.0),
+                        )
+                        .unwrap()
                 };
-                let val = self
-                    .builder
-                    .build_int_compare(predicate, lhs, rhs, &format!("v{}", result.0))
-                    .unwrap();
                 self.value_map.insert(*result, val.into());
             }
 

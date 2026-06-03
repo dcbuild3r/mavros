@@ -77,19 +77,16 @@ impl LowerWitnessArrayOps {
                 index: idx,
                 value,
             } => {
-                if guard.is_some() {
-                    panic!(
-                        "ArraySet inside Guard not supported yet: {:?}",
-                        OpCode::ArraySet {
-                            result: *result,
-                            array: *arr,
-                            index: *idx,
-                            value: *value,
-                        }
-                    );
-                }
                 if self.has_witness_index(function_type_info, *arr, *idx) {
-                    self.gen_witness_array_set(b, function_type_info, *arr, *idx, *value, *result);
+                    self.gen_witness_array_set(
+                        b,
+                        function_type_info,
+                        *arr,
+                        *idx,
+                        *value,
+                        *result,
+                        guard,
+                    );
                     true
                 } else {
                     false
@@ -200,6 +197,7 @@ impl LowerWitnessArrayOps {
         idx: ValueId,
         value: ValueId,
         result: ValueId,
+        guard: Option<ValueId>,
     ) {
         let result_type = function_type_info.get_value_type(result);
         let length = array_len(result_type, "ArraySet result");
@@ -225,10 +223,15 @@ impl LowerWitnessArrayOps {
                 b.cast_to(CastTarget::U(idx_bits), i)
             };
             let eq = b.eq(idx, cmp_index);
+            let update = if let Some(condition) = guard {
+                b.mul(eq, condition)
+            } else {
+                eq
+            };
             let arr_i = b.array_get(arr, i);
             let arr_i_field = b.cast_to_field(arr_i);
 
-            let new_i_field = b.select(eq, value_field, arr_i_field);
+            let new_i_field = b.select(update, value_field, arr_i_field);
             if let Some(target) = result_elem_back_cast {
                 b.cast_to(target, new_i_field)
             } else {
@@ -295,7 +298,59 @@ impl LowerWitnessArrayOps {
             TypeExpr::Slice(_) => {
                 panic!("multidimensional witness array read: slice element types not supported")
             }
-            TypeExpr::Tuple(_) | TypeExpr::Ref(_) | TypeExpr::Function => {
+            TypeExpr::Tuple(target_fields) => {
+                let arr_fields = match &arr_elem_type.expr {
+                    TypeExpr::Tuple(fields) => fields,
+                    other => panic!(
+                        "multidimensional witness array read: expected tuple array element, got {:?}",
+                        other
+                    ),
+                };
+                assert_eq!(
+                    arr_fields.len(),
+                    target_fields.len(),
+                    "tuple witness array read field count mismatch"
+                );
+
+                let mut elems = Vec::with_capacity(target_fields.len());
+                let mut leaf_offset = 0usize;
+                for (i, (arr_field, target_field)) in
+                    arr_fields.iter().zip(target_fields.iter()).enumerate()
+                {
+                    let child_hint = b.tuple_proj(hint, i);
+                    let child_base_key = if leaf_offset == 0 {
+                        base_key
+                    } else {
+                        let offset_const = b.field_const(Field::from(leaf_offset as u128));
+                        b.add(base_key, offset_const)
+                    };
+                    let child = self.gen_witness_array_get_from_hint(
+                        b,
+                        arr,
+                        child_base_key,
+                        child_hint,
+                        arr_field,
+                        target_field,
+                        None,
+                        flag,
+                    );
+                    leaf_offset += leaf_scalar_count(&target_field.strip_all_witness());
+                    elems.push(child);
+                }
+
+                let built_tuple = b.mk_tuple(elems, target_fields.clone());
+                if let Some(result) = result_override {
+                    b.emit(OpCode::Cast {
+                        result,
+                        value: built_tuple,
+                        target: CastTarget::Nop,
+                    });
+                    result
+                } else {
+                    built_tuple
+                }
+            }
+            TypeExpr::Ref(_) | TypeExpr::Function => {
                 panic!(
                     "multidimensional witness array read: unsupported element type {}",
                     target_type
@@ -329,9 +384,10 @@ impl LowerWitnessArrayOps {
 fn leaf_scalar_count(t: &Type) -> usize {
     match &t.expr {
         TypeExpr::Array(inner, n) => n * leaf_scalar_count(inner),
+        TypeExpr::Tuple(fields) => fields.iter().map(leaf_scalar_count).sum(),
         TypeExpr::Field | TypeExpr::U(_) | TypeExpr::I(_) => 1,
         TypeExpr::WitnessOf(inner) => leaf_scalar_count(inner),
-        TypeExpr::Slice(_) | TypeExpr::Ref(_) | TypeExpr::Tuple(_) | TypeExpr::Function => {
+        TypeExpr::Slice(_) | TypeExpr::Ref(_) | TypeExpr::Function => {
             panic!("leaf_scalar_count: unsupported type {}", t)
         }
     }

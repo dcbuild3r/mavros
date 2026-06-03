@@ -2,7 +2,7 @@ use std::{cell::RefCell, rc::Rc};
 
 use crate::compiler::{
     analysis::{
-        symbolic_executor::{self, SymbolicExecutor},
+        symbolic_executor::{self, Context, SymbolicExecutor},
         types::TypeInfo,
     },
     ssa::{
@@ -294,12 +294,46 @@ impl Value {
     }
 }
 
+fn fresh_value_for_type(typ: &Type, ctx: &mut R1CGen) -> Value {
+    match &typ.expr {
+        TypeExpr::Array(elem, count) => Value::mk_array(
+            (0..*count)
+                .map(|_| fresh_value_for_type(elem, ctx))
+                .collect(),
+        ),
+        TypeExpr::Tuple(fields) => Value::mk_tuple(
+            fields
+                .iter()
+                .map(|field| fresh_value_for_type(field, ctx))
+                .collect(),
+        ),
+        TypeExpr::WitnessOf(inner) => fresh_value_for_type(inner, ctx),
+        TypeExpr::Field | TypeExpr::U(_) | TypeExpr::I(_) => {
+            let witness_var = ctx.next_witness();
+            Value::LC(vec![(witness_var, ark_bn254::Fr::ONE)])
+        }
+        TypeExpr::Ref(inner) => Value::Ptr(Rc::new(RefCell::new(fresh_value_for_type(inner, ctx)))),
+        TypeExpr::Slice(_) | TypeExpr::Function => {
+            panic!("unsupported fresh witness type for R1CS: {}", typ)
+        }
+    }
+}
+
 fn flatten_array_into_table(arr: &ArrayData, out: &mut Vec<LC>) {
     for elem in arr.data.iter() {
-        match elem {
-            Value::Array(inner) => flatten_array_into_table(&inner.borrow(), out),
-            _ => out.push(elem.expect_linear_combination()),
+        flatten_value_into_table(elem, out);
+    }
+}
+
+fn flatten_value_into_table(value: &Value, out: &mut Vec<LC>) {
+    match value {
+        Value::Array(inner) => flatten_array_into_table(&inner.borrow(), out),
+        Value::Tuple(inner) => {
+            for elem in inner.borrow().data.iter() {
+                flatten_value_into_table(elem, out);
+            }
         }
+        _ => out.push(value.expect_linear_combination()),
     }
 }
 
@@ -331,13 +365,17 @@ impl symbolic_executor::Context<Value> for R1CGen {
         _func: FunctionId,
         _params: &mut [Value],
         _param_types: &[&Type],
-        _result_types: &[Type],
+        result_types: &[Type],
         unconstrained: bool,
     ) -> Option<Vec<Value>> {
-        assert!(
-            !unconstrained,
-            "ICE: unconstrained calls should be DCE'd before R1CS gen"
-        );
+        if unconstrained {
+            return Some(
+                result_types
+                    .iter()
+                    .map(|result_type| fresh_value_for_type(result_type, self))
+                    .collect(),
+            );
+        }
         None
     }
 
@@ -478,8 +516,40 @@ impl symbolic_executor::Value<R1CGen> for Value {
         }
     }
 
-    fn eq(&self, b: &Self, _ctx: &mut R1CGen) -> Self {
-        self.eq(b)
+    fn eq(&self, b: &Self, ctx: &mut R1CGen) -> Self {
+        if matches!((self, b), (Value::Const(_), Value::Const(_))) {
+            return self.eq(b);
+        }
+
+        let result = {
+            let witness_var = ctx.next_witness();
+            Value::LC(vec![(witness_var, ark_bn254::Fr::ONE)])
+        };
+        let inverse = {
+            let witness_var = ctx.next_witness();
+            Value::LC(vec![(witness_var, ark_bn254::Fr::ONE)])
+        };
+        let diff = self.sub(b);
+        let one = Value::Const(ark_bn254::Fr::ONE);
+        let zero = Value::Const(ark_bn254::Fr::ZERO);
+
+        ctx.constraints.push(R1C {
+            a: result.expect_linear_combination(),
+            b: result.sub(&one).expect_linear_combination(),
+            c: zero.expect_linear_combination(),
+        });
+        ctx.constraints.push(R1C {
+            a: result.expect_linear_combination(),
+            b: diff.expect_linear_combination(),
+            c: zero.expect_linear_combination(),
+        });
+        ctx.constraints.push(R1C {
+            a: diff.expect_linear_combination(),
+            b: inverse.expect_linear_combination(),
+            c: one.sub(&result).expect_linear_combination(),
+        });
+
+        result
     }
 
     fn arith(
@@ -495,6 +565,16 @@ impl symbolic_executor::Value<R1CGen> for Value {
                     *bits > 0 && *bits <= MAX_SUPPORTED_UNSIGNED_BITS,
                     "Unsupported unsigned integer size in R1CS arith: u{bits}"
                 );
+                if !matches!((self, b), (Value::Const(_), Value::Const(_))) {
+                    return match binary_arith_op_kind {
+                        BinaryArithOpKind::Add => self.add(b),
+                        BinaryArithOpKind::Sub => self.sub(b),
+                        _ => panic!(
+                            "Non-constant integer {:?} is not supported in R1CS arith",
+                            binary_arith_op_kind
+                        ),
+                    };
+                }
                 assert!(
                     matches!((self, b), (Value::Const(_), Value::Const(_))),
                     "Non-constant integer {:?} is not supported in R1CS arith",
@@ -522,6 +602,16 @@ impl symbolic_executor::Value<R1CGen> for Value {
                     *bits > 0 && *bits <= MAX_SUPPORTED_SIGNED_BITS,
                     "Unsupported signed integer size in R1CS arith: i{bits}"
                 );
+                if !matches!((self, b), (Value::Const(_), Value::Const(_))) {
+                    return match binary_arith_op_kind {
+                        BinaryArithOpKind::Add => self.add(b),
+                        BinaryArithOpKind::Sub => self.sub(b),
+                        _ => panic!(
+                            "Non-constant integer {:?} is not supported in R1CS arith",
+                            binary_arith_op_kind
+                        ),
+                    };
+                }
                 assert!(
                     matches!((self, b), (Value::Const(_), Value::Const(_))),
                     "Non-constant integer {:?} is not supported in R1CS arith",
@@ -633,9 +723,19 @@ impl symbolic_executor::Value<R1CGen> for Value {
         assert!(a * b == c);
     }
 
-    fn array_get(&self, index: &Self, _out_type: &Type, _ctx: &mut R1CGen) -> Self {
-        let index = index.expect_u32();
-        self.expect_array().borrow().data[index as usize].clone()
+    fn array_get(&self, index: &Self, out_type: &Type, ctx: &mut R1CGen) -> Self {
+        if let Value::Const(_) = index {
+            let index = index.expect_u32();
+            return self.expect_array().borrow().data[index as usize].clone();
+        }
+
+        let result = fresh_value_for_type(out_type, ctx);
+        ctx.lookup(
+            hlssa::LookupTarget::Array(self.clone()),
+            vec![index.clone(), result.clone()],
+            Value::Const(ark_bn254::Fr::ONE),
+        );
+        result
     }
 
     fn tuple_get(&self, index: usize, _out_type: &Type, _ctx: &mut R1CGen) -> Self {
@@ -795,13 +895,12 @@ impl symbolic_executor::Value<R1CGen> for Value {
         Value::LC(vec![(witness_var, ark_bn254::Fr::ONE)])
     }
 
-    fn fresh_witness(_result_type: &Type, ctx: &mut R1CGen) -> Self {
-        let witness_var = ctx.next_witness();
-        Value::LC(vec![(witness_var, ark_bn254::Fr::ONE)])
+    fn fresh_witness(result_type: &Type, ctx: &mut R1CGen) -> Self {
+        fresh_value_for_type(result_type, ctx)
     }
 
     fn value_of(&self, _ctx: &mut R1CGen) -> Self {
-        panic!("ICE: ValueOf should not reach R1CS gen")
+        self.clone()
     }
 
     fn mem_op(&self, _kind: RefCountOp, _ctx: &mut R1CGen) {}

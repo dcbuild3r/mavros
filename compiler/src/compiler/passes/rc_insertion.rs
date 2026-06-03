@@ -387,7 +387,7 @@ impl RCInsertion {
                             // if the original value dies here.
                             let mut bump = *count;
                             if !currently_live.contains(element) {
-                                bump -= 1;
+                                bump = bump.saturating_sub(1);
                             }
                             if bump > 0 {
                                 new_instructions.push(OpCode::MemOp {

@@ -613,6 +613,7 @@ fn lower_function(
 ) -> LLFunction {
     let mut ll_func = LLFunction::empty(function.get_name().to_string());
     let mut val_map: HashMap<ValueId, ValueId> = HashMap::new();
+    let mut slice_lengths: HashMap<ValueId, usize> = HashMap::new();
     let mut block_map: HashMap<BlockId, BlockId> = HashMap::new();
 
     let hl_entry_id = function.get_entry_id();
@@ -663,6 +664,7 @@ fn lower_function(
                 instruction,
                 &mut emitter,
                 &mut val_map,
+                &mut slice_lengths,
                 fn_type_info,
                 fn_map,
                 drop_fns,
@@ -701,6 +703,21 @@ fn add_vm_parameter(func: &mut LLFunction, llssa: &mut LLSSA) -> ValueId {
     id
 }
 
+fn effective_heap_type(
+    typ: &HLType,
+    value: ValueId,
+    slice_lengths: &HashMap<ValueId, usize>,
+) -> HLType {
+    match &typ.expr {
+        HLTypeExpr::Slice(inner) => inner.as_ref().clone().array_of(
+            *slice_lengths
+                .get(&value)
+                .expect("slice length must be known"),
+        ),
+        _ => typ.clone(),
+    }
+}
+
 // =============================================================================
 // Instruction lowering
 // =============================================================================
@@ -711,6 +728,7 @@ fn lower_instruction(
     instruction: &crate::compiler::ssa::hlssa::OpCode,
     e: &mut LLBlockEmitter<'_>,
     val_map: &mut HashMap<ValueId, ValueId>,
+    slice_lengths: &mut HashMap<ValueId, usize>,
     fn_type_info: &FunctionTypeInfo,
     fn_map: &HashMap<FunctionId, FunctionId>,
     drop_fns: &mut Vec<DropFnEntry>,
@@ -895,14 +913,37 @@ fn lower_instruction(
             lower_mk_array(e, val_map, *result, elems, elem_type, *count);
         }
 
+        OpCode::MkSeq {
+            result,
+            elems,
+            seq_type: SequenceTargetType::Slice,
+            elem_type,
+        } => {
+            lower_mk_array(e, val_map, *result, elems, elem_type, elems.len());
+            slice_lengths.insert(*result, elems.len());
+        }
+
         OpCode::MkRepeated {
             result,
             element,
-            seq_type: _,
+            seq_type,
             count,
             elem_type,
         } => {
             lower_mk_repeated(e, val_map, *result, *element, elem_type, *count);
+            if matches!(seq_type, SequenceTargetType::Slice) {
+                slice_lengths.insert(*result, *count);
+            }
+        }
+
+        OpCode::SliceLen { result, slice } => {
+            let len = *slice_lengths
+                .get(slice)
+                .expect("SliceLen requires a statically lowered slice length");
+            let result_type = fn_type_info.get_value_type(*result);
+            let bits = integer_width(result_type);
+            let ll_result = e.emit_int_const(bits, len as u64);
+            val_map.insert(*result, ll_result);
         }
 
         OpCode::ArrayGet {
@@ -910,7 +951,9 @@ fn lower_instruction(
             array,
             index,
         } => {
-            lower_array_get(e, val_map, fn_type_info, *result, *array, *index);
+            let arr_type = fn_type_info.get_value_type(*array);
+            let effective_type = effective_heap_type(arr_type, *array, slice_lengths);
+            lower_array_get(e, val_map, &effective_type, *result, *array, *index);
         }
 
         OpCode::ArraySet {
@@ -922,7 +965,7 @@ fn lower_instruction(
             lower_array_set(
                 e,
                 val_map,
-                fn_type_info,
+                &effective_heap_type(fn_type_info.get_value_type(*array), *array, slice_lengths),
                 *result,
                 *array,
                 *index,
@@ -941,7 +984,8 @@ fn lower_instruction(
             if val_type.is_witness_of() {
                 lower_ad_rc_bump(e, val_map, *n, *value);
             } else {
-                lower_rc_bump(e, val_map, fn_type_info, *n, *value);
+                let effective_type = effective_heap_type(val_type, *value, slice_lengths);
+                lower_rc_bump(e, val_map, &effective_type, *n, *value);
             }
         }
 
@@ -953,7 +997,8 @@ fn lower_instruction(
             if val_type.is_witness_of() {
                 lower_ad_rc_drop(e, val_map, *value, ad_fns);
             } else {
-                lower_rc_drop(e, val_map, fn_type_info, *value, drop_fns, ad_fns);
+                let effective_type = effective_heap_type(val_type, *value, slice_lengths);
+                lower_rc_drop(e, val_map, &effective_type, *value, drop_fns, ad_fns);
             }
         }
 
@@ -1405,6 +1450,8 @@ fn lower_instruction(
             );
         }
 
+        OpCode::Rangecheck { .. } => {}
+
         _ => panic!(
             "Unsupported opcode in HLSSA->LLSSA lowering: {:?}",
             instruction
@@ -1793,12 +1840,11 @@ fn lower_ref_load(
 fn lower_array_get(
     e: &mut LLBlockEmitter<'_>,
     val_map: &mut HashMap<ValueId, ValueId>,
-    fn_type_info: &FunctionTypeInfo,
+    arr_type: &HLType,
     result: ValueId,
     array: ValueId,
     index: ValueId,
 ) {
-    let arr_type = fn_type_info.get_value_type(array);
     let (et, count) = array_info(arr_type);
     let rc_struct = rc_array_struct(et, count);
     let es = elem_struct(et);
@@ -1827,7 +1873,7 @@ fn lower_array_get(
 fn lower_array_set(
     e: &mut LLBlockEmitter<'_>,
     val_map: &mut HashMap<ValueId, ValueId>,
-    fn_type_info: &FunctionTypeInfo,
+    arr_type: &HLType,
     result: ValueId,
     array: ValueId,
     index: ValueId,
@@ -1835,7 +1881,6 @@ fn lower_array_set(
     drop_fns: &mut Vec<DropFnEntry>,
     ad_fns: &mut AdFunctions,
 ) {
-    let arr_type = fn_type_info.get_value_type(array);
     let (et, count) = array_info(arr_type);
     let rc_struct = rc_array_struct(et, count);
     let es = elem_struct(et);
@@ -1979,12 +2024,10 @@ fn modify_rc(e: &mut LLBlockEmitter<'_>, rc_ptr: ValueId, delta: i64) -> ValueId
 fn lower_rc_bump(
     e: &mut LLBlockEmitter<'_>,
     val_map: &HashMap<ValueId, ValueId>,
-    fn_type_info: &FunctionTypeInfo,
+    val_type: &HLType,
     n: usize,
     value: ValueId,
 ) {
-    let val_type = fn_type_info.get_value_type(value);
-
     let rc_struct = match &val_type.expr {
         HLTypeExpr::Array(inner, count) => rc_array_struct(inner, *count),
         HLTypeExpr::Tuple(elements) => rc_tuple_struct(elements),
@@ -2003,12 +2046,11 @@ fn lower_rc_bump(
 fn lower_rc_drop(
     e: &mut LLBlockEmitter<'_>,
     val_map: &HashMap<ValueId, ValueId>,
-    fn_type_info: &FunctionTypeInfo,
+    arr_type: &HLType,
     value: ValueId,
     drop_fns: &mut Vec<DropFnEntry>,
     ad_fns: &mut AdFunctions,
 ) {
-    let arr_type = fn_type_info.get_value_type(value);
     let drop_fn_id = get_or_create_drop_fn(arr_type, e.ssa, drop_fns, ad_fns);
     let ll_arr = val_map[&value];
     e.call(drop_fn_id, vec![ll_arr], 0);
@@ -3174,12 +3216,31 @@ fn emit_forward_key_value_lookup(
 
 fn int_to_field(e: &mut LLBlockEmitter<'_>, value: ValueId, bits: usize) -> ValueId {
     assert!(
-        bits <= 64,
-        "Array lookup only supports integer elements up to 64 bits, got {}",
+        bits <= MAX_SUPPORTED_UNSIGNED_BITS,
+        "Array lookup only supports integer elements up to 128 bits, got {}",
         bits
     );
-    let value64 = if bits == 64 { value } else { e.zext(value, 64) };
-    u64_as_field(e, value64)
+    if bits <= 64 {
+        let value64 = if bits == 64 { value } else { e.zext(value, 64) };
+        return u64_as_field(e, value64);
+    }
+
+    let lo = e.truncate(value, 64);
+    let shift = e.emit_int_const(bits as u32, 64);
+    let shifted = e.int_arith(IntArithOp::UShr, value, shift);
+    let hi = e.truncate(shifted, 64);
+    let zero = e.emit_int_const(64, 0);
+    let limbs = e.mk_struct(LLStruct::limbs(), vec![lo, hi, zero, zero]);
+    e.field_from_limbs(limbs)
+}
+
+fn lookup_leaf_count(elem_type: &HLType) -> usize {
+    match &elem_type.expr {
+        HLTypeExpr::Array(inner, count) => count * lookup_leaf_count(inner),
+        HLTypeExpr::Tuple(fields) => fields.iter().map(lookup_leaf_count).sum(),
+        HLTypeExpr::Field | HLTypeExpr::U(_) | HLTypeExpr::I(_) | HLTypeExpr::WitnessOf(_) => 1,
+        _ => panic!("Unsupported array element type in lookup: {}", elem_type),
+    }
 }
 
 fn load_pure_lookup_elem_as_field(
@@ -3205,6 +3266,87 @@ fn load_pure_lookup_elem_as_field(
             panic!("Forward array lookup cannot materialize WitnessOf table elements")
         }
         _ => panic!("Unsupported array element type in lookup: {}", elem_type),
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ForwardLookupEmit<'a> {
+    inv_cnst_off: ValueId,
+    a_base: ValueId,
+    elem_index: ValueId,
+    leaves_per_elem: usize,
+    elem_offset: usize,
+    elem_struct: &'a LLStruct,
+}
+
+fn emit_forward_lookup_leaf_store(
+    e: &mut LLBlockEmitter<'_>,
+    elem_ptr: ValueId,
+    elem_type: &HLType,
+    ctx: &ForwardLookupEmit<'_>,
+) {
+    match &elem_type.expr {
+        HLTypeExpr::Array(inner, count) => {
+            let arr = e.ll_load(elem_ptr, LLType::Ptr);
+            let rc_struct = rc_array_struct(inner, *count);
+            let data = e.struct_field_ptr(arr, rc_struct, 2);
+            let inner_struct = elem_struct(inner);
+            let inner_leaves = lookup_leaf_count(inner);
+            for i in 0..*count {
+                let idx = e.emit_int_const(64, i as u64);
+                let child_ptr = e.array_elem_ptr(data, inner_struct.clone(), idx);
+                emit_forward_lookup_leaf_store(
+                    e,
+                    child_ptr,
+                    inner,
+                    &ForwardLookupEmit {
+                        elem_offset: ctx.elem_offset + i * inner_leaves,
+                        elem_struct: &inner_struct,
+                        ..*ctx
+                    },
+                );
+            }
+        }
+        HLTypeExpr::Tuple(fields) => {
+            let tuple = e.ll_load(elem_ptr, LLType::Ptr);
+            let rc_struct = rc_tuple_struct(fields);
+            let mut offset = ctx.elem_offset;
+            for (i, field_type) in fields.iter().enumerate() {
+                let field_ptr = e.struct_field_ptr(tuple, rc_struct.clone(), i + 1);
+                emit_forward_lookup_leaf_store(
+                    e,
+                    field_ptr,
+                    field_type,
+                    &ForwardLookupEmit {
+                        elem_offset: offset,
+                        elem_struct: ctx.elem_struct,
+                        ..*ctx
+                    },
+                );
+                offset += lookup_leaf_count(field_type);
+            }
+        }
+        _ => {
+            let elem_field = load_pure_lookup_elem_as_field(e, elem_ptr, elem_type);
+            let elem_index = if ctx.leaves_per_elem == 1 {
+                ctx.elem_index
+            } else {
+                let leaves = e.emit_int_const(64, ctx.leaves_per_elem as u64);
+                e.int_arith(IntArithOp::Mul, ctx.elem_index, leaves)
+            };
+            let leaf_index = if ctx.elem_offset == 0 {
+                elem_index
+            } else {
+                let offset = e.emit_int_const(64, ctx.elem_offset as u64);
+                e.int_arith(IntArithOp::Add, elem_index, offset)
+            };
+            let i_i32 = e.truncate(leaf_index, 32);
+            let two_i32 = e.emit_int_const(32, 2);
+            let doubled_i = e.int_arith(IntArithOp::Mul, i_i32, two_i32);
+            let table_slot_idx = e.int_arith(IntArithOp::Add, ctx.inv_cnst_off, doubled_i);
+            let table_slot = e.array_elem_ptr(ctx.a_base, LLStruct::field_elem(), table_slot_idx);
+            e.ll_store(table_slot, elem_field);
+        }
     }
 }
 
@@ -3247,9 +3389,61 @@ fn ad_bump_lookup_elem_db(
     }
 }
 
+fn ad_bump_lookup_leaf_db_at(
+    e: &mut LLBlockEmitter<'_>,
+    elem_ptr: ValueId,
+    elem_type: &HLType,
+    leaf_offset: usize,
+    coeff: ValueId,
+    bump_db_fn: FunctionId,
+) {
+    match &elem_type.expr {
+        HLTypeExpr::Array(inner, count) => {
+            let inner_leaves = lookup_leaf_count(inner);
+            let child_index = leaf_offset / inner_leaves;
+            assert!(child_index < *count, "lookup leaf offset outside array");
+            let child_offset = leaf_offset % inner_leaves;
+            let arr = e.ll_load(elem_ptr, LLType::Ptr);
+            let rc_struct = rc_array_struct(inner, *count);
+            let data = e.struct_field_ptr(arr, rc_struct, 2);
+            let inner_struct = elem_struct(inner);
+            let idx = e.emit_int_const(64, child_index as u64);
+            let child_ptr = e.array_elem_ptr(data, inner_struct, idx);
+            ad_bump_lookup_leaf_db_at(e, child_ptr, inner, child_offset, coeff, bump_db_fn);
+        }
+        HLTypeExpr::Tuple(fields) => {
+            let tuple = e.ll_load(elem_ptr, LLType::Ptr);
+            let rc_struct = rc_tuple_struct(fields);
+            let mut start = 0;
+            for (i, field_type) in fields.iter().enumerate() {
+                let field_leaves = lookup_leaf_count(field_type);
+                if leaf_offset < start + field_leaves {
+                    let field_ptr = e.struct_field_ptr(tuple, rc_struct, i + 1);
+                    ad_bump_lookup_leaf_db_at(
+                        e,
+                        field_ptr,
+                        field_type,
+                        leaf_offset - start,
+                        coeff,
+                        bump_db_fn,
+                    );
+                    return;
+                }
+                start += field_leaves;
+            }
+            panic!("lookup leaf offset outside tuple");
+        }
+        _ => {
+            assert_eq!(leaf_offset, 0, "lookup leaf offset outside scalar");
+            ad_bump_lookup_elem_db(e, elem_ptr, elem_type, coeff, bump_db_fn);
+        }
+    }
+}
+
 fn generate_array_lookup_function(llssa: &mut LLSSA, array_type: &HLType) -> LLFunction {
     let (elem_type, count) = array_info(array_type);
-    let lookup = LookupTableSpec::array(count);
+    let leaves_per_elem = lookup_leaf_count(elem_type);
+    let lookup = LookupTableSpec::array(count * leaves_per_elem);
     let rc_struct = rc_array_struct(elem_type, count);
     let elem_struct = elem_struct(elem_type);
     let mut func = new_ll_function(llssa, format!("__array_lookup_{}", array_type));
@@ -3287,13 +3481,19 @@ fn generate_array_lookup_function(llssa: &mut LLSSA, array_type: &HLType) -> LLF
             let data = e.struct_field_ptr(array, rc_struct.clone(), 2);
             e.build_counted_loop(count, vec![], |e, i_i64, _| {
                 let elem_ptr = e.array_elem_ptr(data, elem_struct.clone(), i_i64);
-                let elem_field = load_pure_lookup_elem_as_field(e, elem_ptr, elem_type);
-                let i_i32 = e.truncate(i_i64, 32);
-                let two_i32 = e.emit_int_const(32, 2);
-                let doubled_i = e.int_arith(IntArithOp::Mul, i_i32, two_i32);
-                let table_slot_idx = e.int_arith(IntArithOp::Add, inv_cnst_off, doubled_i);
-                let table_slot = e.array_elem_ptr(a_base, LLStruct::field_elem(), table_slot_idx);
-                e.ll_store(table_slot, elem_field);
+                emit_forward_lookup_leaf_store(
+                    e,
+                    elem_ptr,
+                    elem_type,
+                    &ForwardLookupEmit {
+                        inv_cnst_off,
+                        a_base,
+                        elem_index: i_i64,
+                        leaves_per_elem,
+                        elem_offset: 0,
+                        elem_struct: &elem_struct,
+                    },
+                );
                 vec![]
             });
         },
@@ -3747,7 +3947,8 @@ fn emit_array_ad_init_body(
     witness_layout: WitnessLayout,
 ) -> ValueId {
     let (elem_type, count) = array_info(array_type);
-    let lookup = LookupTableSpec::array(count);
+    let leaves_per_elem = lookup_leaf_count(elem_type);
+    let lookup = LookupTableSpec::array(count * leaves_per_elem);
     let rc_struct = rc_array_struct(elem_type, count);
     let elem_struct = elem_struct(elem_type);
     let data = e.struct_field_ptr(array, rc_struct.clone(), 2);
@@ -3764,8 +3965,35 @@ fn emit_array_ad_init_body(
             e.ll_store(table_id_ptr, snap_u64);
         },
         |e, i_i64, x_coeff| {
-            let elem_ptr = e.array_elem_ptr(data, elem_struct.clone(), i_i64);
-            ad_bump_lookup_elem_db(e, elem_ptr, elem_type, x_coeff, bump_db_fn);
+            let (elem_index, leaf_rem) = if leaves_per_elem == 1 {
+                (i_i64, None)
+            } else {
+                let leaves = e.emit_int_const(64, leaves_per_elem as u64);
+                (
+                    e.int_arith(IntArithOp::UDiv, i_i64, leaves),
+                    Some(e.int_arith(IntArithOp::URem, i_i64, leaves)),
+                )
+            };
+            let elem_ptr = e.array_elem_ptr(data, elem_struct.clone(), elem_index);
+            if let Some(leaf_rem) = leaf_rem {
+                let zero_i64 = e.emit_int_const(64, 0);
+                let zero_field = u64_as_field(e, zero_i64);
+                for offset in 0..leaves_per_elem {
+                    let offset_val = e.emit_int_const(64, offset as u64);
+                    let selected = e.int_eq(leaf_rem, offset_val);
+                    let selected_coeff = e.select(selected, x_coeff, zero_field);
+                    ad_bump_lookup_leaf_db_at(
+                        e,
+                        elem_ptr,
+                        elem_type,
+                        offset,
+                        selected_coeff,
+                        bump_db_fn,
+                    );
+                }
+            } else {
+                ad_bump_lookup_leaf_db_at(e, elem_ptr, elem_type, 0, x_coeff, bump_db_fn);
+            }
         },
     )
 }

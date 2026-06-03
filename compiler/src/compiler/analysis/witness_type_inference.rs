@@ -432,18 +432,17 @@ impl WitnessTypeInference {
         let arg_types_out: Vec<WitnessShape> = entry_params
             .iter()
             .zip(arg_types.iter())
-            .map(|((value_id, _), original_arg)| {
-                match original_arg {
-                    WitnessShape::Ref(_, _) => {
-                        // Look up the alloc_inner for this ref value
-                        if let Some(inner) = alloc_inner.get(value_id) {
-                            WitnessShape::Ref(WitnessType::Pure, Box::new(inner.clone()))
-                        } else {
-                            original_arg.clone()
-                        }
+            .map(|((value_id, _), original_arg)| match original_arg {
+                WitnessShape::Ref(_, _) => {
+                    if let Some(WitnessShape::Ref(_, inner)) = value_wt.get(value_id) {
+                        WitnessShape::Ref(WitnessType::Pure, inner.clone())
+                    } else if let Some(inner) = alloc_inner.get(value_id) {
+                        WitnessShape::Ref(WitnessType::Pure, Box::new(inner.clone()))
+                    } else {
+                        original_arg.clone()
                     }
-                    _ => original_arg.clone(),
                 }
+                _ => original_arg.clone(),
             })
             .collect();
 
@@ -588,6 +587,13 @@ impl WitnessTypeInference {
                         // The alloc's elem_type may not match the actual stored value's
                         let new_inner = current_inner.join(&store_wt);
                         alloc_inner.insert(origin_id, new_inner);
+                    } else if let Some(WitnessShape::Ref(ptr_info, inner)) =
+                        value_wt.get(ptr).cloned()
+                    {
+                        let store_wt =
+                            val_wt.with_toplevel_info(val_wt.toplevel_info().join(block_cw));
+                        let new_inner = inner.join(&store_wt);
+                        value_wt.insert(*ptr, WitnessShape::Ref(ptr_info, Box::new(new_inner)));
                     }
                 }
                 OpCode::Load { result: r, ptr } => {

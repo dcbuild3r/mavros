@@ -1436,6 +1436,7 @@ impl symbolic_executor::Value<CostAnalysis> for SpecSplitValue {
     fn expect_constant_bool(&self, _ctx: &mut CostAnalysis) -> bool {
         let specialized = match &self.specialized {
             Value::U(1, v) => *v != 0,
+            Value::Unknown(ScalarKind::U(1)) => false,
             _ => panic!(
                 "Expected constant bool, got specialized={:?}",
                 self.specialized
@@ -1443,6 +1444,7 @@ impl symbolic_executor::Value<CostAnalysis> for SpecSplitValue {
         };
         let unspecialized = match &self.unspecialized {
             Value::U(1, v) => *v != 0,
+            Value::Unknown(ScalarKind::U(1)) => false,
             _ => panic!(
                 "Expected constant bool, got unspecialized={:?}",
                 self.unspecialized

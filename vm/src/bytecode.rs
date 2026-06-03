@@ -19,6 +19,7 @@ pub const FELT_LIMBS: usize = 4;
 pub const ELEM_WORD: usize = 0;
 pub const ELEM_FIELD: usize = 1;
 pub const ELEM_WITNESS: usize = 2;
+pub const ELEM_U128: usize = 3;
 
 /// Read an array element as a Field and bump out_db accordingly.
 #[inline(always)]
@@ -26,6 +27,12 @@ unsafe fn lookup_elem_bump_db(ptr: *mut u64, elem_kind: usize, coeff: Field, vm:
     match elem_kind {
         ELEM_WORD => unsafe {
             let v = Field::from(*(ptr as *const u64));
+            *vm.data.as_ad.out_db += coeff * v;
+        },
+        ELEM_U128 => unsafe {
+            let lo = *(ptr as *const u64) as u128;
+            let hi = *ptr.add(1) as u128;
+            let v = Field::from(lo | (hi << 64));
             *vm.data.as_ad.out_db += coeff * v;
         },
         ELEM_FIELD => unsafe {
@@ -45,6 +52,11 @@ unsafe fn lookup_elem_bump_db(ptr: *mut u64, elem_kind: usize, coeff: Field, vm:
 unsafe fn read_pure_elem_as_field(ptr: *mut u64, elem_kind: usize) -> Field {
     match elem_kind {
         ELEM_WORD => Field::from(unsafe { *(ptr as *const u64) }),
+        ELEM_U128 => unsafe {
+            let lo = *(ptr as *const u64) as u128;
+            let hi = *ptr.add(1) as u128;
+            Field::from(lo | (hi << 64))
+        },
         ELEM_FIELD => unsafe { *(ptr as *const Field) },
         _ => unreachable!(),
     }
@@ -192,11 +204,13 @@ impl std::ops::Not for U128 {
 unsafe fn for_each_array_leaf<F: FnMut(usize, *mut u64)>(
     array: BoxedValue,
     stride: usize,
+    struct_layouts: &[StructDescriptor],
     mut f: F,
 ) -> usize {
     unsafe fn go<F: FnMut(usize, *mut u64)>(
         array: BoxedValue,
         stride: usize,
+        struct_layouts: &[StructDescriptor],
         f: &mut F,
         idx: &mut usize,
     ) {
@@ -207,8 +221,11 @@ unsafe fn for_each_array_leaf<F: FnMut(usize, *mut u64)>(
                 let cell_ptr = array.array_idx(i, 1);
                 let inner = unsafe { *(cell_ptr as *mut BoxedValue) };
                 let inner_layout = inner.layout();
-                if inner_layout.is_boxed_array() || inner_layout.is_prim_array() {
-                    unsafe { go(inner, stride, f, idx) };
+                if inner_layout.is_boxed_array()
+                    || inner_layout.is_prim_array()
+                    || inner_layout.data_type() == DataType::Struct
+                {
+                    unsafe { go(inner, stride, struct_layouts, f, idx) };
                 } else {
                     f(*idx, cell_ptr);
                     *idx += 1;
@@ -220,6 +237,29 @@ unsafe fn for_each_array_leaf<F: FnMut(usize, *mut u64)>(
                 f(*idx, array.array_idx(i, stride));
                 *idx += 1;
             }
+        } else if layout.data_type() == DataType::Struct {
+            let view = layout.as_struct(struct_layouts);
+            let mut field_offset = 0;
+            for i in 0..view.field_count() {
+                let field_ptr = unsafe { array.data().add(field_offset) };
+                if view.is_refcounted(i) {
+                    let inner = unsafe { *(field_ptr as *mut BoxedValue) };
+                    let inner_layout = inner.layout();
+                    if inner_layout.is_boxed_array()
+                        || inner_layout.is_prim_array()
+                        || inner_layout.data_type() == DataType::Struct
+                    {
+                        unsafe { go(inner, stride, struct_layouts, f, idx) };
+                    } else {
+                        f(*idx, field_ptr);
+                        *idx += 1;
+                    }
+                } else {
+                    f(*idx, field_ptr);
+                    *idx += 1;
+                }
+                field_offset += view.field_size(i);
+            }
         } else {
             panic!(
                 "Unexpected array data type in lookup-table flatten: {:?}",
@@ -228,7 +268,7 @@ unsafe fn for_each_array_leaf<F: FnMut(usize, *mut u64)>(
         }
     }
     let mut idx = 0;
-    unsafe { go(array, stride, &mut f, &mut idx) };
+    unsafe { go(array, stride, struct_layouts, &mut f, &mut idx) };
     idx
 }
 
@@ -1403,6 +1443,26 @@ mod def {
     }
 
     #[opcode]
+    fn to_bytes_le(#[frame] val: Field, count: u64, #[out] res: *mut BoxedValue, vm: &mut VM) {
+        let val = ark_ff::PrimeField::into_bigint(val);
+        let r = BoxedValue::alloc(BoxedLayout::array(count as usize, false), vm);
+        unsafe {
+            for i in 0..count {
+                let byte_idx = i as usize;
+                let limb_idx = byte_idx / 8;
+                let byte_in_limb = byte_idx % 8;
+                let byte_val = if limb_idx < val.0.len() {
+                    (val.0[limb_idx] >> (byte_in_limb * 8)) & 0xFF
+                } else {
+                    0
+                };
+                *r.array_idx(i as usize, 1) = byte_val;
+            }
+            *res = r;
+        }
+    }
+
+    #[opcode]
     fn to_bits_le(#[out] res: *mut BoxedValue, #[frame] val: Field, count: u64, vm: &mut VM) {
         panic!("to_bits_be_lt_8 not implemented");
     }
@@ -1654,8 +1714,9 @@ mod def {
             };
 
             // Dump array element values into the x-slots (even offsets) of the table section
+            let struct_layouts = vm.struct_layouts.clone();
             let length = unsafe {
-                for_each_array_leaf(array, stride, |i, elem_ptr| {
+                for_each_array_leaf(array, stride, &struct_layouts, |i, elem_ptr| {
                     let elem_field = read_pure_elem_as_field(elem_ptr, elem_kind);
                     // Write it into the x-slot (even offset: 2*i) of the constraint section
                     *vm.data.as_forward.out_a_base.add(cnst_off + 2 * i) = elem_field;
@@ -1832,9 +1893,10 @@ mod def {
             let inverses_witness_section_offset = unsafe { vm.data.as_ad.current_wit_tables_off };
             let multiplicities_wit_offset = unsafe { vm.data.as_ad.current_wit_multiplicities_off };
 
+            let struct_layouts = vm.struct_layouts.clone();
             let length =
                 unsafe {
-                    for_each_array_leaf(array, stride, |i, elem_ptr| {
+                    for_each_array_leaf(array, stride, &struct_layouts, |i, elem_ptr| {
                         // x-constraint at base + 2*i: A=[(beta,1)], B=v_i, C=[(x,-1)]
                         let x_coeff =
                             *vm.data.as_ad.ad_coeffs.offset(
