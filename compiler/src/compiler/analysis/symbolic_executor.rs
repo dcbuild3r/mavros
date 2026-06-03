@@ -742,7 +742,7 @@ where
 
 /// Recursively materialize a single constant into a `V`, bottom up.
 ///
-/// `memo` caches array constants by structural value so identical (sub-)arrays share one
+/// `memo` caches heap constants by structural value so identical (sub-)heap consts share one
 /// materialized `V`.
 fn materialize_const_value<V, Ctx>(
     c: &Constant,

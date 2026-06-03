@@ -18,8 +18,9 @@ use crate::compiler::{
         types::TypeInfo,
     },
     pass_manager::{Analysis, AnalysisId, AnalysisStore, Pass},
+    passes::dead_code_elimination::is_initially_live,
     ssa::{
-        BlockId, FunctionId, ValueId,
+        BlockId, FunctionId, Instruction, Terminator, ValueId,
         hlssa::{
             BinaryArithOpKind, CastTarget, CmpKind, Constant, Endianness, HLFunction, HLSSA,
             MAX_SUPPORTED_UNSIGNED_BITS, OpCode, Radix, RefCountOp, SequenceTargetType, Type,
@@ -38,6 +39,51 @@ fn bit_mask(width: usize) -> Option<u128> {
     } else {
         Some((1u128 << width) - 1)
     }
+}
+
+/// Estimate the candidate body's code size *after* the dead-code elimination that runs immediately
+/// after this pass — i.e. counting only instructions that survive DCE.
+///
+/// This matters because `SymbolicExecutor::run` eagerly materializes *every* program constant
+/// (including all of poseidon's round-constant/MDS arrays) into the candidate body via `MkSeq`,
+/// regardless of whether the specialized function uses them. Those dead `MkSeq`s would otherwise
+/// dominate `HLFunction::code_size` and sink the savings/size ratio, rejecting otherwise-profitable
+/// specializations (e.g. `pow_32` folded against a constant exponent). The cost estimator counts
+/// constants as free, so measuring live size here keeps the accept/reject gate consistent with it.
+///
+/// Specialized bodies are a single fully-unrolled block (the executor emits into the entry block
+/// and `on_jmp` is a no-op), so a single reverse mark-sweep seeded from terminator operands and
+/// `is_initially_live` roots is exact. Uses `witness_shape_frozen = false` to match the `pre_r1c`
+/// DCE that follows the specializer in the witness-spilling pipeline.
+///
+/// Should be refactored as part of #157 to use an actual liveness query.
+fn live_code_size(body: &HLFunction) -> usize {
+    let mut live: HashSet<ValueId> = HashSet::new();
+    for (_, block) in body.get_blocks() {
+        match block.get_terminator() {
+            Some(Terminator::Return(vals)) | Some(Terminator::Jmp(_, vals)) => {
+                live.extend(vals.iter().copied());
+            }
+            Some(Terminator::JmpIf(cond, _, _)) => {
+                live.insert(*cond);
+            }
+            None => {}
+        }
+    }
+
+    let mut size = 0;
+    for (_, block) in body.get_blocks() {
+        // Reverse order so a use is visited before its definition within the block.
+        let instrs: Vec<&OpCode> = block.get_instructions().collect();
+        for op in instrs.into_iter().rev() {
+            let used = op.get_results().any(|r| live.contains(r));
+            if used || is_initially_live(op, false) {
+                size += op.get_inputs().count() + 1;
+                live.extend(op.get_inputs().copied());
+            }
+        }
+    }
+    size
 }
 
 pub struct Specializer {
@@ -486,9 +532,35 @@ impl symbolic_executor::Value<SpecializationState<'_>> for Val {
         &self,
         endianness: Endianness,
         size: usize,
-        _out_type: &Type,
+        out_type: &Type,
         ctx: &mut SpecializationState,
     ) -> Self {
+        // Constant-fold a known field input into a constant bit array, mirroring the cost
+        // estimator (which treats `to_bits` on a constant as free). This is what lets the
+        // `pow_32(_, 5)`-style specializations collapse to a handful of constraints. Indexing the
+        // result folds through the `ConstVal::Array` entry, so the `MkSeq` is dead and is dropped
+        // by the DCE that runs right after this pass.
+        //
+        // This will evolve to work on general constants not just arrays over #184.
+        if let Some(ConstVal::Field(f)) = ctx.const_vals.get(&self.0).cloned() {
+            let bits = f.into_bigint().to_bits_le();
+            let elem_type = out_type.get_array_element();
+            let mut elem_ids = Vec::with_capacity(size);
+            for i in 0..size {
+                let bit_index = match endianness {
+                    Endianness::Little => i,
+                    Endianness::Big => size - i - 1,
+                };
+                let bit = u128::from(bits.get(bit_index).copied().unwrap_or(false));
+                let bit_id = ctx.u_const(1, bit);
+                ctx.const_vals.insert(bit_id, ConstVal::U(1, bit));
+                elem_ids.push(bit_id);
+            }
+            let arr = ctx.mk_seq(elem_ids.clone(), SequenceTargetType::Array(size), elem_type);
+            ctx.const_vals.insert(arr, ConstVal::Array(elem_ids));
+            return Self(arr);
+        }
+
         let val = ctx.to_bits(self.0, endianness, size);
         ctx.const_vals
             .insert(val, ConstVal::BitsOf(Box::new(self.0), size, endianness));
@@ -934,7 +1006,11 @@ impl Specializer {
             state.body
         };
 
-        let code_bloat = body.code_size();
+        // Measure the body's *live* code size (see `live_code_size`): the symbolic executor
+        // eagerly materializes every program constant into the body, but those unused `MkSeq`s are
+        // dropped by the DCE that runs right after this pass, so counting them would wrongly reject
+        // profitable specializations.
+        let code_bloat = live_code_size(&body);
         let savings_to_code_ratio = summary.specialization_total_savings as f64 / code_bloat as f64;
 
         // Put the body back unconditionally. On rejection it stays at `candidate_id` only

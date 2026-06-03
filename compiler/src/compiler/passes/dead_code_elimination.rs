@@ -20,6 +20,63 @@ pub struct DCE {
     config: Config,
 }
 
+/// Whether an instruction is a liveness root (kept even with no used results), e.g. because it has
+/// side effects or constrains the witness.
+///
+/// `witness_shape_frozen` mirrors [`Config`]: before R1C generation `ToBits` / `ToRadix` /
+/// `FreshWitness` / unpinned `WriteWitness` still shape the witness and are pinned live; afterwards
+/// they become ordinary eliminable values.
+///
+/// Shared with the specializer's code-size estimate so its accept/reject gate measures the same
+/// "what survives DCE" notion this pass enforces.
+pub(crate) fn is_initially_live(instruction: &OpCode, witness_shape_frozen: bool) -> bool {
+    match instruction {
+        OpCode::Call {
+            unconstrained: true,
+            ..
+        } => false,
+        OpCode::Call { .. } | OpCode::Store { .. } => true,
+        OpCode::Assert { .. } | OpCode::AssertCmp { .. } => true,
+        OpCode::AssertR1C { .. }
+        | OpCode::Constrain { .. }
+        | OpCode::Lookup { .. }
+        | OpCode::DLookup { .. }
+        | OpCode::NextDCoeff { .. }
+        | OpCode::BumpD { .. }
+        | OpCode::MemOp { .. }
+        | OpCode::Rangecheck { .. }
+        | OpCode::Todo { .. }
+        | OpCode::InitGlobal { .. }
+        | OpCode::DropGlobal { .. } => true,
+        OpCode::WriteWitness { pinned, .. } => witness_shape_frozen || *pinned,
+        OpCode::FreshWitness { .. } => witness_shape_frozen,
+        OpCode::ToBits { .. } | OpCode::ToRadix { .. } => !witness_shape_frozen,
+        OpCode::Load { .. }
+        | OpCode::BinaryArithOp { .. }
+        | OpCode::Cmp { .. }
+        | OpCode::Alloc { .. }
+        | OpCode::Select { .. }
+        | OpCode::ArrayGet { .. }
+        | OpCode::ArraySet { .. }
+        | OpCode::TupleProj { .. }
+        | OpCode::SlicePush { .. }
+        | OpCode::SliceLen { .. }
+        | OpCode::MkSeq { .. }
+        | OpCode::MkRepeated { .. }
+        | OpCode::Cast { .. }
+        | OpCode::SExt { .. }
+        | OpCode::BitRange { .. }
+        | OpCode::Not { .. }
+        | OpCode::MulConst { .. }
+        | OpCode::ReadGlobal { .. }
+        | OpCode::MkTuple { .. }
+        | OpCode::ValueOf { .. }
+        | OpCode::Spread { .. }
+        | OpCode::Unspread { .. } => false,
+        OpCode::Guard { inner, .. } => is_initially_live(inner.as_ref(), witness_shape_frozen),
+    }
+}
+
 #[derive(Debug)]
 enum WorkItem {
     LiveBlock(FunctionId, BlockId),
@@ -84,51 +141,7 @@ impl DCE {
     }
 
     fn is_initially_live(&self, instruction: &OpCode) -> bool {
-        match instruction {
-            OpCode::Call {
-                unconstrained: true,
-                ..
-            } => false,
-            OpCode::Call { .. } | OpCode::Store { .. } => true,
-            OpCode::Assert { .. } | OpCode::AssertCmp { .. } => true,
-            OpCode::AssertR1C { .. }
-            | OpCode::Constrain { .. }
-            | OpCode::Lookup { .. }
-            | OpCode::DLookup { .. }
-            | OpCode::NextDCoeff { .. }
-            | OpCode::BumpD { .. }
-            | OpCode::MemOp { .. }
-            | OpCode::Rangecheck { .. }
-            | OpCode::Todo { .. }
-            | OpCode::InitGlobal { .. }
-            | OpCode::DropGlobal { .. } => true,
-            OpCode::WriteWitness { pinned, .. } => self.config.witness_shape_frozen || *pinned,
-            OpCode::FreshWitness { .. } => self.config.witness_shape_frozen,
-            OpCode::ToBits { .. } | OpCode::ToRadix { .. } => !self.config.witness_shape_frozen,
-            OpCode::Load { .. }
-            | OpCode::BinaryArithOp { .. }
-            | OpCode::Cmp { .. }
-            | OpCode::Alloc { .. }
-            | OpCode::Select { .. }
-            | OpCode::ArrayGet { .. }
-            | OpCode::ArraySet { .. }
-            | OpCode::TupleProj { .. }
-            | OpCode::SlicePush { .. }
-            | OpCode::SliceLen { .. }
-            | OpCode::MkSeq { .. }
-            | OpCode::MkRepeated { .. }
-            | OpCode::Cast { .. }
-            | OpCode::SExt { .. }
-            | OpCode::BitRange { .. }
-            | OpCode::Not { .. }
-            | OpCode::MulConst { .. }
-            | OpCode::ReadGlobal { .. }
-            | OpCode::MkTuple { .. }
-            | OpCode::ValueOf { .. }
-            | OpCode::Spread { .. }
-            | OpCode::Unspread { .. } => false,
-            OpCode::Guard { inner, .. } => self.is_initially_live(inner.as_ref()),
-        }
+        is_initially_live(instruction, self.config.witness_shape_frozen)
     }
 
     pub fn do_run(&self, ssa: &mut HLSSA, cfg: &FlowAnalysis) {
